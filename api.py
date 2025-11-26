@@ -295,7 +295,7 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
                 app.logger.warning(f"Unexpected response structure: {result}")
                 return None
         else:
-            app.logger.error(f"Nhost request failed: {response.status_code}")
+            app.logger.error(f"Nhost request failed: {response.status_code} - {graphql_url}")
             app.logger.error(f"Response text: {response.text}")
             try:
                 error_json = response.json()
