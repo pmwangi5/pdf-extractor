@@ -49,7 +49,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def _send_to_nhost(data, job_id, filename):
+def _send_to_nhost(data, job_id, filename, user_id=None):
     """
     Send extracted data to Nhost for embeddings.
     
@@ -57,6 +57,7 @@ def _send_to_nhost(data, job_id, filename):
         data: Extracted PDF data
         job_id: Job identifier
         filename: Original filename
+        user_id: Optional user ID
     """
     if not NHOST_BACKEND_URL or not NHOST_ADMIN_SECRET:
         app.logger.warning("Nhost configuration missing, skipping Nhost integration")
@@ -92,6 +93,22 @@ def _send_to_nhost(data, job_id, filename):
         
         # Option 1: GraphQL mutation (recommended)
         graphql_url = f"{NHOST_BACKEND_URL}/v1/graphql"
+        
+        # Build mutation object
+        mutation_object = {
+            "job_id": job_id,
+            "filename": filename,
+            "metadata": payload['metadata'],
+            "text_content": combined_text,
+            "text_by_page": payload['text_by_page'],
+            "tables": payload['tables'],
+            "status": "ready_for_embedding"
+        }
+        
+        # Add user_id if provided
+        if user_id:
+            mutation_object["user_id"] = user_id
+        
         graphql_mutation = {
             "query": """
                 mutation InsertPDFExtraction($object: pdf_extractions_insert_input!) {
@@ -104,15 +121,7 @@ def _send_to_nhost(data, job_id, filename):
                 }
             """,
             "variables": {
-                "object": {
-                    "job_id": job_id,
-                    "filename": filename,
-                    "metadata": payload['metadata'],
-                    "text_content": combined_text,
-                    "text_by_page": payload['text_by_page'],
-                    "tables": payload['tables'],
-                    "status": "ready_for_embedding"
-                }
+                "object": mutation_object
             }
         }
         
@@ -180,14 +189,15 @@ def _send_webhook(job_id, status, data=None, error=None):
         app.logger.error(f"Error sending webhook: {str(e)}")
 
 
-def _process_extraction_async(file, job_id, extract_type='all', pages=None, 
+def _process_extraction_async(file_path, original_filename, job_id, extract_type='all', pages=None, 
                               include_tables=True, send_to_nhost=True, 
                               send_webhook=True, user_id=None):
     """
     Process PDF extraction asynchronously.
     
     Args:
-        file: Uploaded file object
+        file_path: Path to saved file
+        original_filename: Original filename
         job_id: Unique job identifier
         extract_type: Type of extraction
         pages: List of page numbers
@@ -196,30 +206,62 @@ def _process_extraction_async(file, job_id, extract_type='all', pages=None,
         send_webhook: Whether to send webhook
         user_id: Optional user ID from Next.js
     """
-    jobs[job_id] = {'status': 'processing', 'progress': 0}
+    jobs[job_id] = {
+        'status': 'processing', 
+        'progress': 0,
+        'stage': 'file_received',
+        'message': 'File received, starting extraction...'
+    }
     
     try:
-        # Process extraction
-        result, filename = _process_pdf_extraction(file, extract_type, pages, include_tables)
+        # Update: Reading file
+        jobs[job_id] = {
+            'status': 'processing',
+            'progress': 10,
+            'stage': 'reading',
+            'message': 'Reading PDF file...'
+        }
+        
+        # Process extraction using file path
+        result, filename = _process_pdf_extraction_from_path(file_path, original_filename, extract_type, pages, include_tables)
         
         if result is None:
-            jobs[job_id] = {'status': 'failed', 'error': filename}
+            jobs[job_id] = {'status': 'failed', 'error': filename, 'stage': 'failed'}
             if send_webhook:
                 _send_webhook(job_id, 'failed', error=filename)
             return
         
-        jobs[job_id] = {'status': 'processing', 'progress': 50}
+        # Update: Completed reading
+        jobs[job_id] = {
+            'status': 'processing',
+            'progress': 50,
+            'stage': 'reading_complete',
+            'message': 'Completed reading PDF, extracting data...'
+        }
         
         # Send to Nhost if enabled
         nhost_result = None
         if send_to_nhost:
-            nhost_result = _send_to_nhost(result, job_id, filename)
-            jobs[job_id] = {'status': 'processing', 'progress': 90}
+            jobs[job_id] = {
+                'status': 'processing',
+                'progress': 60,
+                'stage': 'sending_to_db',
+                'message': 'Sending data to database...'
+            }
+            nhost_result = _send_to_nhost(result, job_id, filename, user_id)
+            jobs[job_id] = {
+                'status': 'processing',
+                'progress': 90,
+                'stage': 'sending_to_db',
+                'message': 'Data sent to database successfully'
+            }
         
-        # Update job status
+        # Update job status - Done
         jobs[job_id] = {
             'status': 'completed',
             'progress': 100,
+            'stage': 'done',
+            'message': 'Processing complete!',
             'filename': filename,
             'data': result,
             'nhost_result': nhost_result
@@ -242,7 +284,7 @@ def _process_extraction_async(file, job_id, extract_type='all', pages=None,
 
 def _process_pdf_extraction(file, extract_type='all', pages=None, include_tables=True):
     """
-    Internal function to process PDF extraction.
+    Internal function to process PDF extraction from file object.
     
     Args:
         file: Uploaded file object
@@ -265,9 +307,28 @@ def _process_pdf_extraction(file, extract_type='all', pages=None, include_tables
     
     try:
         file.save(temp_path)
-        
+        return _process_pdf_extraction_from_path(temp_path, filename, extract_type, pages, include_tables)
+    except Exception as e:
+        return None, str(e)
+
+
+def _process_pdf_extraction_from_path(file_path, filename, extract_type='all', pages=None, include_tables=True):
+    """
+    Internal function to process PDF extraction from file path.
+    
+    Args:
+        file_path: Path to PDF file
+        filename: Original filename
+        extract_type: Type of extraction ('all', 'text', 'metadata', 'tables')
+        pages: List of page numbers (0-indexed) or None for all pages
+        include_tables: Whether to include tables in extraction
+    
+    Returns:
+        Tuple of (result_dict, filename) or (None, error_message)
+    """
+    try:
         # Extract data
-        with PDFExtractor(temp_path) as extractor:
+        with PDFExtractor(file_path) as extractor:
             if extract_type == 'metadata':
                 result = {'metadata': extractor.extract_metadata()}
             elif extract_type == 'text':
@@ -285,10 +346,15 @@ def _process_pdf_extraction(file, extract_type='all', pages=None, include_tables
         
         return result, filename
         
+    except Exception as e:
+        return None, str(e)
     finally:
         # Clean up temporary file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass  # Ignore cleanup errors
 
 
 @app.route('/', methods=['GET'])
@@ -359,7 +425,8 @@ def extract_pdf():
         nhost_result = None
         if send_to_nhost:
             job_id = str(uuid.uuid4())
-            nhost_result = _send_to_nhost(result, job_id, filename)
+            user_id = request.form.get('user_id')
+            nhost_result = _send_to_nhost(result, job_id, filename, user_id)
         
         response = {
             'success': True,
@@ -421,10 +488,22 @@ def extract_pdf_async():
         # Generate job ID
         job_id = str(uuid.uuid4())
         
-        # Start async processing
+        # Save file to disk before starting async thread (file object closes when request ends)
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_{filename}")
+        
+        try:
+            file.save(temp_path)
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to save file: {str(e)}'
+            }), 500
+        
+        # Start async processing with file path instead of file object
         thread = threading.Thread(
             target=_process_extraction_async,
-            args=(file, job_id, extract_type, pages, include_tables, send_to_nhost, send_webhook, user_id)
+            args=(temp_path, filename, job_id, extract_type, pages, include_tables, send_to_nhost, send_webhook, user_id)
         )
         thread.daemon = True
         thread.start()
@@ -465,12 +544,18 @@ def get_job_status(job_id):
     
     if job['status'] == 'processing':
         response['progress'] = job.get('progress', 0)
+        response['stage'] = job.get('stage', 'processing')
+        response['message'] = job.get('message', 'Processing...')
     elif job['status'] == 'completed':
+        response['progress'] = 100
+        response['stage'] = job.get('stage', 'done')
+        response['message'] = job.get('message', 'Processing complete!')
         response['filename'] = job.get('filename')
         response['data'] = job.get('data')
         response['nhost_result'] = job.get('nhost_result')
     elif job['status'] == 'failed':
         response['error'] = job.get('error')
+        response['stage'] = job.get('stage', 'failed')
     
     return jsonify(response)
 
