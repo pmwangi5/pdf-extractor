@@ -13,7 +13,7 @@ This document describes the database schema required for the PDF Extractor API i
 
 The API automatically sends data to this table when `send_to_nhost=true`.
 
-## Table: `pdf_extractions`
+## Table: `pdf_embeddings`
 
 Main table for storing PDF extraction data. This table stores all extracted content including text, metadata, tables, and chunked text for embeddings.
 
@@ -21,7 +21,7 @@ Main table for storing PDF extraction data. This table stores all extracted cont
 
 ```sql
 -- Create table for PDF extractions
-CREATE TABLE pdf_extractions (
+CREATE TABLE pdf_embeddings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   job_id TEXT UNIQUE NOT NULL,
@@ -39,10 +39,10 @@ CREATE TABLE pdf_extractions (
 );
 
 -- Create indexes for faster queries
-CREATE INDEX idx_pdf_extractions_user_id ON pdf_extractions(user_id);
-CREATE INDEX idx_pdf_extractions_status ON pdf_extractions(status);
-CREATE INDEX idx_pdf_extractions_job_id ON pdf_extractions(job_id);
-CREATE INDEX idx_pdf_extractions_created_at ON pdf_extractions(created_at DESC);
+CREATE INDEX idx_pdf_embeddings_user_id ON pdf_embeddings(user_id);
+CREATE INDEX idx_pdf_embeddings_status ON pdf_embeddings(status);
+CREATE INDEX idx_pdf_embeddings_job_id ON pdf_embeddings(job_id);
+CREATE INDEX idx_pdf_embeddings_created_at ON pdf_embeddings(created_at DESC);
 ```
 
 ### Column Descriptions
@@ -145,15 +145,16 @@ CREATE INDEX idx_pdf_extractions_created_at ON pdf_extractions(created_at DESC);
 }
 ```
 
-## Optional: Separate Embeddings Table
+## Optional: Separate Embedding Vectors Table
 
-If you want to store embeddings separately (recommended for large-scale applications):
+If you want to store embedding vectors separately from the main table (recommended for large-scale applications):
 
 ```sql
--- Create table for embeddings (optional, if storing separately)
-CREATE TABLE pdf_embeddings (
+-- Create table for embedding vectors (optional, if storing separately)
+-- Note: This is different from the main pdf_embeddings table
+CREATE TABLE pdf_embedding_vectors (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  pdf_extraction_id UUID REFERENCES pdf_extractions(id) ON DELETE CASCADE,
+  pdf_embedding_id UUID REFERENCES pdf_embeddings(id) ON DELETE CASCADE,
   chunk_index INTEGER NOT NULL,
   embedding VECTOR(1536),  -- Adjust dimension based on your embedding model
   chunk_text TEXT,
@@ -165,11 +166,11 @@ CREATE TABLE pdf_embeddings (
 );
 
 -- Create indexes
-CREATE INDEX idx_pdf_embeddings_extraction ON pdf_embeddings(pdf_extraction_id);
-CREATE INDEX idx_pdf_embeddings_chunk_index ON pdf_embeddings(pdf_extraction_id, chunk_index);
+CREATE INDEX idx_pdf_embedding_vectors_embedding ON pdf_embedding_vectors(pdf_embedding_id);
+CREATE INDEX idx_pdf_embedding_vectors_chunk_index ON pdf_embedding_vectors(pdf_embedding_id, chunk_index);
 
 -- Enable vector similarity search (if using pgvector)
--- CREATE INDEX idx_pdf_embeddings_vector ON pdf_embeddings USING ivfflat (embedding vector_cosine_ops);
+-- CREATE INDEX idx_pdf_embedding_vectors_vector ON pdf_embedding_vectors USING ivfflat (embedding vector_cosine_ops);
 ```
 
 **Note:** Adjust the `VECTOR(1536)` dimension based on your embedding model:
@@ -215,8 +216,8 @@ Set up Hasura permissions to allow:
 The API uses this mutation to insert data:
 
 ```graphql
-mutation InsertPDFExtraction($object: pdf_extractions_insert_input!) {
-  insert_pdf_extractions_one(object: $object) {
+mutation InsertPDFEmbedding($object: pdf_embeddings_insert_input!) {
+  insert_pdf_embeddings_one(object: $object) {
     id
     job_id
     status
@@ -251,10 +252,10 @@ mutation InsertPDFExtraction($object: pdf_extractions_insert_input!) {
 
 ## GraphQL Query Examples
 
-### Get User's PDF Extractions
+### Get User's PDF Embeddings
 ```graphql
-query GetPdfExtractions($userId: uuid!) {
-  pdf_extractions(
+query GetPdfEmbeddings($userId: uuid!) {
+  pdf_embeddings(
     where: { user_id: { _eq: $userId } },
     order_by: { created_at: desc }
   ) {
@@ -270,10 +271,10 @@ query GetPdfExtractions($userId: uuid!) {
 }
 ```
 
-### Get Extractions Ready for Embedding
+### Get Embeddings Ready for Processing
 ```graphql
-query GetReadyExtractions($userId: uuid!) {
-  pdf_extractions(
+query GetReadyEmbeddings($userId: uuid!) {
+  pdf_embeddings(
     where: { 
       user_id: { _eq: $userId },
       status: { _eq: "ready_for_embedding" }
@@ -289,10 +290,10 @@ query GetReadyExtractions($userId: uuid!) {
 }
 ```
 
-### Get Specific Extraction with Chunks
+### Get Specific Embedding with Chunks
 ```graphql
-query GetExtractionWithChunks($extractionId: uuid!) {
-  pdf_extractions_by_pk(id: $extractionId) {
+query GetEmbeddingWithChunks($embeddingId: uuid!) {
+  pdf_embeddings_by_pk(id: $embeddingId) {
     id
     job_id
     metadata
@@ -310,8 +311,8 @@ query GetExtractionWithChunks($extractionId: uuid!) {
 
 ### Get Filename from Metadata
 ```graphql
-query GetExtractionsWithFilename($userId: uuid!) {
-  pdf_extractions(
+query GetEmbeddingsWithFilename($userId: uuid!) {
+  pdf_embeddings(
     where: { user_id: { _eq: $userId } }
   ) {
     id
@@ -347,8 +348,8 @@ Complete migration script for Nhost/Hasura:
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Create pdf_extractions table
-CREATE TABLE IF NOT EXISTS pdf_extractions (
+-- Create pdf_embeddings table
+CREATE TABLE IF NOT EXISTS pdf_embeddings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   job_id TEXT UNIQUE NOT NULL,
@@ -366,10 +367,10 @@ CREATE TABLE IF NOT EXISTS pdf_extractions (
 );
 
 -- Create indexes
-CREATE INDEX IF NOT EXISTS idx_pdf_extractions_user_id ON pdf_extractions(user_id);
-CREATE INDEX IF NOT EXISTS idx_pdf_extractions_status ON pdf_extractions(status);
-CREATE INDEX IF NOT EXISTS idx_pdf_extractions_job_id ON pdf_extractions(job_id);
-CREATE INDEX IF NOT EXISTS idx_pdf_extractions_created_at ON pdf_extractions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pdf_embeddings_user_id ON pdf_embeddings(user_id);
+CREATE INDEX IF NOT EXISTS idx_pdf_embeddings_status ON pdf_embeddings(status);
+CREATE INDEX IF NOT EXISTS idx_pdf_embeddings_job_id ON pdf_embeddings(job_id);
+CREATE INDEX IF NOT EXISTS idx_pdf_embeddings_created_at ON pdf_embeddings(created_at DESC);
 ```
 
 ## Notes

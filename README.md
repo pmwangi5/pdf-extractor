@@ -389,7 +389,7 @@ The CLI outputs JSON with the following structure:
     "tables": {...}
   },
   "nhost_result": {
-    "insert_pdf_extractions_one": {
+    "insert_pdf_embeddings_one": {
       "id": "uuid",
       "job_id": "uuid",
       "filename": "manual.pdf",
@@ -439,7 +439,7 @@ The API automatically sends extracted data to Nhost/Hasura when `send_to_nhost=t
 
 **Database Schema:**
 ```sql
-CREATE TABLE pdf_extractions (
+CREATE TABLE pdf_embeddings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   job_id TEXT UNIQUE NOT NULL,
   user_id UUID REFERENCES auth.users(id),
@@ -459,8 +459,8 @@ CREATE TABLE pdf_extractions (
 **GraphQL Mutation:**
 The API uses the following mutation:
 ```graphql
-mutation InsertPDFExtraction($object: pdf_extractions_insert_input!) {
-  insert_pdf_extractions_one(object: $object) {
+mutation InsertPDFEmbedding($object: pdf_embeddings_insert_input!) {
+  insert_pdf_embeddings_one(object: $object) {
     id
     job_id
     filename

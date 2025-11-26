@@ -205,7 +205,7 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         graphql_url = f"{NHOST_BACKEND_URL}/v1/graphql"
         
         # Build mutation object matching Nhost table structure
-        # Table: pdf_extractions
+        # Table: pdf_embeddings
         # Columns: id (auto), created_at (auto), job_id, user_id, file_url, metadata, 
         #          text_content, text_by_page, text_chunks, chunk_count, tables, 
         #          status, nhost_embedding_id (optional), upload_device
@@ -228,8 +228,8 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         
         graphql_mutation = {
             "query": """
-                mutation InsertPDFExtraction($object: pdf_extractions_insert_input!) {
-                    insert_pdf_extractions_one(object: $object) {
+                mutation InsertPDFEmbedding($object: pdf_embeddings_insert_input!) {
+                    insert_pdf_embeddings_one(object: $object) {
                         id
                         job_id
                         status

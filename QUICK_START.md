@@ -72,7 +72,7 @@ curl https://your-app.railway.app/job/<job_id>
 
 ## 🔧 Nhost Setup
 
-1. Create a table `pdf_extractions` in Nhost
+1. Create a table `pdf_embeddings` in Nhost
 2. Set up GraphQL permissions
 3. Configure webhook/function for embedding generation (optional)
 
