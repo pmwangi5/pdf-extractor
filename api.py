@@ -162,7 +162,12 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
     """
     if not NHOST_BACKEND_URL or not NHOST_ADMIN_SECRET:
         app.logger.warning("Nhost configuration missing, skipping Nhost integration")
+        app.logger.warning(f"NHOST_BACKEND_URL: {NHOST_BACKEND_URL[:50] if NHOST_BACKEND_URL else 'NOT SET'}...")
+        app.logger.warning(f"NHOST_ADMIN_SECRET: {'SET' if NHOST_ADMIN_SECRET else 'NOT SET'}")
         return None
+    
+    app.logger.info(f"Attempting to send data to Nhost for job {job_id}")
+    app.logger.info(f"Nhost URL: {NHOST_BACKEND_URL}/v1/graphql")
     
     try:
         # Prepare data for Nhost
@@ -246,6 +251,10 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         # For large PDFs, increase timeout
         timeout = 120 if len(chunks) > 100 else 60 if len(chunks) > 50 else 30
         
+        app.logger.info(f"Sending GraphQL mutation to Nhost (chunks: {len(chunks)}, timeout: {timeout}s)")
+        app.logger.debug(f"Mutation object keys: {list(mutation_object.keys())}")
+        app.logger.debug(f"User ID: {user_id}, Upload device: {upload_device}")
+        
         response = requests.post(
             graphql_url,
             json=graphql_mutation,
@@ -253,15 +262,32 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
             timeout=timeout
         )
         
+        app.logger.info(f"Nhost response status: {response.status_code}")
+        
         if response.status_code == 200:
             result = response.json()
+            app.logger.debug(f"Nhost response: {result}")
+            
             if 'errors' in result:
                 app.logger.error(f"Nhost GraphQL errors: {result['errors']}")
+                app.logger.error(f"Full error response: {result}")
                 return None
-            app.logger.info(f"Successfully sent data to Nhost for job {job_id}")
-            return result.get('data', {})
+            
+            if 'data' in result and result.get('data', {}).get('insert_pdf_embeddings_one'):
+                app.logger.info(f"Successfully sent data to Nhost for job {job_id}")
+                app.logger.info(f"Inserted record ID: {result['data']['insert_pdf_embeddings_one'].get('id')}")
+                return result.get('data', {})
+            else:
+                app.logger.warning(f"Unexpected response structure: {result}")
+                return None
         else:
-            app.logger.error(f"Nhost request failed: {response.status_code} - {response.text}")
+            app.logger.error(f"Nhost request failed: {response.status_code}")
+            app.logger.error(f"Response text: {response.text}")
+            try:
+                error_json = response.json()
+                app.logger.error(f"Error JSON: {error_json}")
+            except:
+                pass
             return None
             
     except Exception as e:
@@ -374,7 +400,12 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
                 'stage': 'sending_to_db',
                 'message': 'Chunking text for embeddings...'
             }
+            app.logger.info(f"Calling _send_to_nhost for job {job_id}, user_id: {user_id}, upload_device: {upload_device}")
             nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device)
+            if nhost_result is None:
+                app.logger.warning(f"Failed to send data to Nhost for job {job_id}")
+            else:
+                app.logger.info(f"Successfully sent to Nhost for job {job_id}: {nhost_result}")
             jobs[job_id] = {
                 'status': 'processing',
                 'progress': 90,
@@ -549,6 +580,20 @@ def index():
 def health_check():
     """Health check endpoint."""
     return jsonify({'status': 'healthy', 'service': 'PDF Extractor API'})
+
+
+@app.route('/debug/nhost', methods=['GET'])
+def debug_nhost():
+    """Debug endpoint to check Nhost configuration."""
+    config = {
+        'nhost_backend_url_set': bool(NHOST_BACKEND_URL),
+        'nhost_backend_url_preview': NHOST_BACKEND_URL[:50] + '...' if NHOST_BACKEND_URL and len(NHOST_BACKEND_URL) > 50 else NHOST_BACKEND_URL,
+        'nhost_admin_secret_set': bool(NHOST_ADMIN_SECRET),
+        'webhook_url_set': bool(WEBHOOK_URL),
+        'graphql_url': f"{NHOST_BACKEND_URL}/v1/graphql" if NHOST_BACKEND_URL else None,
+        'table_name': 'pdf_embeddings'
+    }
+    return jsonify(config)
 
 
 @app.route('/extract', methods=['POST'])
