@@ -47,6 +47,11 @@ UPLOAD_FOLDER = tempfile.gettempdir()
 # Nhost configuration
 NHOST_BACKEND_URL = os.environ.get('NHOST_BACKEND_URL', '').rstrip('/')
 NHOST_ADMIN_SECRET = os.environ.get('NHOST_ADMIN_SECRET', '')
+# Optional: Override GraphQL endpoint if different from default
+NHOST_GRAPHQL_URL = os.environ.get('NHOST_GRAPHQL_URL', '')
+# WEBHOOK_URL: Optional URL to your Next.js API route that receives notifications
+# Example: https://your-app.vercel.app/api/webhook/pdf-extraction
+# This is called when PDF processing completes (success or failure)
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
@@ -206,8 +211,17 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
             'x-hasura-admin-secret': NHOST_ADMIN_SECRET
         }
         
-        # Option 1: GraphQL mutation (recommended)
-        graphql_url = f"{NHOST_BACKEND_URL}/v1/graphql"
+        # GraphQL mutation endpoint
+        # Use NHOST_GRAPHQL_URL if set, otherwise construct from NHOST_BACKEND_URL
+        if NHOST_GRAPHQL_URL:
+            graphql_url = NHOST_GRAPHQL_URL
+        else:
+            # Default: append /v1/graphql to backend URL
+            # If this doesn't work, set NHOST_GRAPHQL_URL environment variable
+            # with the exact GraphQL endpoint from your Nhost dashboard
+            graphql_url = f"{NHOST_BACKEND_URL}/v1/graphql"
+        
+        app.logger.info(f"GraphQL URL: {graphql_url}")
         
         # Build mutation object matching Nhost table structure
         # Table: pdf_embeddings
@@ -584,14 +598,26 @@ def health_check():
 
 @app.route('/debug/nhost', methods=['GET'])
 def debug_nhost():
-    """Debug endpoint to check Nhost configuration."""
+    """
+    Debug endpoint to check Nhost configuration.
+    
+    WEBHOOK_URL: Optional URL to your Next.js webhook endpoint.
+    Example: https://your-app.vercel.app/api/webhook/pdf-extraction
+    This is used to notify your Next.js app when PDF processing completes.
+    """
+    graphql_url = NHOST_GRAPHQL_URL if NHOST_GRAPHQL_URL else (f"{NHOST_BACKEND_URL}/v1/graphql" if NHOST_BACKEND_URL else None)
+    
     config = {
         'nhost_backend_url_set': bool(NHOST_BACKEND_URL),
-        'nhost_backend_url_preview': NHOST_BACKEND_URL[:50] + '...' if NHOST_BACKEND_URL and len(NHOST_BACKEND_URL) > 50 else NHOST_BACKEND_URL,
+        'nhost_backend_url': NHOST_BACKEND_URL if NHOST_BACKEND_URL else None,
+        'nhost_graphql_url_set': bool(NHOST_GRAPHQL_URL),
+        'nhost_graphql_url': NHOST_GRAPHQL_URL if NHOST_GRAPHQL_URL else None,
         'nhost_admin_secret_set': bool(NHOST_ADMIN_SECRET),
         'webhook_url_set': bool(WEBHOOK_URL),
-        'graphql_url': f"{NHOST_BACKEND_URL}/v1/graphql" if NHOST_BACKEND_URL else None,
-        'table_name': 'pdf_embeddings'
+        'webhook_url': WEBHOOK_URL if WEBHOOK_URL else None,
+        'graphql_url_being_used': graphql_url,
+        'table_name': 'pdf_embeddings',
+        'note': 'If getting 404, check your Nhost dashboard → Settings → API for the correct GraphQL endpoint URL and set NHOST_GRAPHQL_URL'
     }
     return jsonify(config)
 
