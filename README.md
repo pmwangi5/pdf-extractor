@@ -16,6 +16,10 @@ A production-ready Python application for extracting data from PDF files. Optimi
 - **Webhook Support**: Notify Next.js apps when processing completes
 - **Progress Tracking**: Real-time status updates with stages and percentages
 - **Flexible Page Selection**: Extract data from specific pages or entire document
+- **PDF File Validation**: Magic byte validation and integrity checks to prevent malicious uploads
+- **DigitalOcean Spaces Integration**: Automatic PDF storage to S3-compatible storage
+- **AWS SES Email Notifications**: Email alerts when embeddings are successfully created
+- **Subscriber Management**: Automatic creation of subscriber entries for tracking
 
 ## Installation
 
@@ -28,10 +32,30 @@ pip install -r requirements.txt
 ```env
 PORT=5000
 FLASK_DEBUG=False
+
+# Nhost Configuration
 NHOST_BACKEND_URL=https://your-project.nhost.run
 NHOST_ADMIN_SECRET=your-admin-secret
+NHOST_GRAPHQL_URL=https://your-project.nhost.run/v1/graphql  # Optional: Override default
+
+# Webhook Configuration
 WEBHOOK_URL=https://your-nextjs-app.com/api/webhook/pdf-extraction
+
+# CORS Configuration
 CORS_ORIGINS=https://your-app.com,https://app.vercel.app
+
+# DigitalOcean Spaces (S3-compatible) Configuration
+DO_SPACES_URL=nyc3.digitaloceanspaces.com  # or full URL: https://nyc3.digitaloceanspaces.com
+DO_SPACES_ID=your-spaces-access-key-id
+DO_SPACES_SECRET=your-spaces-secret-access-key
+DO_SPACES_BUCKET=your-bucket-name
+
+# AWS SES Email Configuration
+AWS_SES_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your-aws-access-key-id
+AWS_SECRET_ACCESS_KEY=your-aws-secret-access-key
+AWS_SES_FROM_EMAIL=noreply@yourdomain.com  # Must be verified in SES
+AWS_SES_TO_EMAIL=admin@yourdomain.com  # Where notifications are sent
 ```
 
 ## Usage
@@ -99,8 +123,18 @@ The server will start on `http://0.0.0.0:5000` by default.
 | `FLASK_DEBUG` | Enable debug mode | No | False |
 | `NHOST_BACKEND_URL` | Nhost backend URL | Yes* | - |
 | `NHOST_ADMIN_SECRET` | Nhost admin secret | Yes* | - |
+| `NHOST_GRAPHQL_URL` | Nhost GraphQL endpoint (optional override) | No | Auto-detected |
 | `WEBHOOK_URL` | Next.js webhook endpoint | No | - |
 | `CORS_ORIGINS` | Comma-separated allowed origins | No | * (all) |
+| `DO_SPACES_URL` | DigitalOcean Spaces endpoint | No | - |
+| `DO_SPACES_ID` | DigitalOcean Spaces access key ID | No | - |
+| `DO_SPACES_SECRET` | DigitalOcean Spaces secret key | No | - |
+| `DO_SPACES_BUCKET` | DigitalOcean Spaces bucket name | No | - |
+| `AWS_SES_REGION` | AWS SES region | No | us-east-1 |
+| `AWS_ACCESS_KEY_ID` | AWS access key ID | No | - |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret access key | No | - |
+| `AWS_SES_FROM_EMAIL` | Verified sender email in SES | No | - |
+| `AWS_SES_TO_EMAIL` | Recipient email for notifications | No | - |
 
 *Required if using Nhost integration
 
@@ -134,6 +168,8 @@ Content-Type: multipart/form-data
 - `include_tables`: Optional. 'true' or 'false' (default: 'true')
 - `send_to_nhost`: Optional. 'true' or 'false' (default: 'false')
 - `user_id`: Optional. User ID (UUID format)
+- `user_display_name`: Optional. User display name for email notifications
+- `upload_device`: Optional. Device/platform identifier (default: 'web')
 
 **Response:**
 ```json
@@ -164,6 +200,9 @@ Content-Type: multipart/form-data
 - `send_to_nhost`: Optional. 'true' or 'false' (default: 'true')
 - `send_webhook`: Optional. 'true' or 'false' (default: 'true')
 - `user_id`: Optional. User ID from Next.js (UUID format)
+- `user_display_name`: Optional. User display name for email notifications
+- `upload_device`: Optional. Device/platform identifier (default: 'web')
+- `file_url`: Optional. URL if file is already stored in S3/storage
 
 **Response (202 Accepted):**
 ```json
@@ -256,7 +295,6 @@ Content-Type: multipart/form-data
 #### API Examples
 
 **Using curl:**
-
 ```bash
 # Health check
 curl https://your-api.railway.app/health
@@ -265,6 +303,8 @@ curl https://your-api.railway.app/health
 curl -X POST -F "file=@manual.pdf" \
   -F "send_to_nhost=true" \
   -F "send_webhook=true" \
+  -F "user_id=user-uuid-here" \
+  -F "user_display_name=John Doe" \
   https://your-api.railway.app/extract/async
 
 # Check job status
@@ -285,9 +325,9 @@ curl -X POST -F "file=@document.pdf" \
 ```
 
 **Using Python requests:**
-
 ```python
 import requests
+import time
 
 # Async extraction (recommended)
 url = "https://your-api.railway.app/extract/async"
@@ -296,7 +336,10 @@ data = {
     'extract_type': 'all',
     'include_tables': 'true',
     'send_to_nhost': 'true',
-    'send_webhook': 'true'
+    'send_webhook': 'true',
+    'user_id': 'user-uuid-here',
+    'user_display_name': 'John Doe',
+    'upload_device': 'web'
 }
 
 response = requests.post(url, files=files, data=data)
@@ -392,7 +435,6 @@ The CLI outputs JSON with the following structure:
     "insert_pdf_embeddings_one": {
       "id": "uuid",
       "job_id": "uuid",
-      "filename": "manual.pdf",
       "status": "ready_for_embedding"
     }
   }
@@ -433,28 +475,37 @@ The API is optimized for large PDFs (800+ pages, car manuals, technical document
 - **Dynamic Timeouts**: Adjusts based on document size
 - **Background Processing**: Async endpoint prevents timeouts
 
+## PDF File Validation
+
+The API includes robust PDF file validation to prevent malicious uploads:
+
+- **Magic Byte Check**: Validates PDF file signature (`%PDF`)
+- **Integrity Check**: Uses PyPDF2 to verify PDF structure
+- **File Type Validation**: Only allows `.pdf` extensions
+- **File Size Limits**: Maximum 200MB per file
+
+Invalid or corrupted PDFs are rejected before processing begins.
+
 ## Nhost/Hasura Integration
 
 The API automatically sends extracted data to Nhost/Hasura when `send_to_nhost=true`:
 
 **Database Schema:**
-```sql
-CREATE TABLE pdf_embeddings (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  job_id TEXT UNIQUE NOT NULL,
-  user_id UUID REFERENCES auth.users(id),
-  filename TEXT NOT NULL,
-  metadata JSONB,
-  text_content TEXT,
-  text_by_page JSONB,
-  text_chunks JSONB,  -- Chunked text for embeddings
-  chunk_count INTEGER,
-  tables JSONB,
-  status TEXT DEFAULT 'processing',
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
+See `DB_STRUCTURE.md` for complete database schema details.
+
+The API stores data in the `pdf_embeddings` table with the following key fields:
+- `id`: UUID primary key
+- `job_id`: Unique job identifier
+- `user_id`: User who uploaded the PDF
+- `metadata`: JSONB containing PDF metadata (filename, page count, etc.)
+- `text_content`: Full extracted text
+- `text_by_page`: JSONB with page-by-page text
+- `text_chunks`: JSONB with intelligently chunked text for embeddings
+- `chunk_count`: Number of text chunks
+- `tables`: JSONB with extracted tables
+- `status`: Processing status
+- `file_url`: URL to PDF stored in DigitalOcean Spaces
+- `upload_device`: Device/platform used for upload
 
 **GraphQL Mutation:**
 The API uses the following mutation:
@@ -463,11 +514,52 @@ mutation InsertPDFEmbedding($object: pdf_embeddings_insert_input!) {
   insert_pdf_embeddings_one(object: $object) {
     id
     job_id
-    filename
     status
   }
 }
 ```
+
+**Subscriber Management:**
+After successful embedding creation, the API automatically creates an entry in the `pdf_embeddings_subscribers` table to track user subscriptions to embeddings.
+
+## DigitalOcean Spaces Integration
+
+When configured, the API automatically uploads processed PDFs to DigitalOcean Spaces (S3-compatible storage):
+
+- **Storage Location**: `docs_pdf_embedding_sources/{pdf_embedding_id}/{filename}`
+- **File Organization**: Each PDF is stored in a folder named after its embedding ID
+- **Database Update**: The `file_url` field is automatically updated after successful upload
+- **Private Storage**: Files are stored with private ACL (configurable)
+
+**Configuration:**
+Set the following environment variables:
+- `DO_SPACES_URL`: Spaces endpoint (e.g., `nyc3.digitaloceanspaces.com`)
+- `DO_SPACES_ID`: Access key ID
+- `DO_SPACES_SECRET`: Secret access key
+- `DO_SPACES_BUCKET`: Bucket name
+
+## AWS SES Email Notifications
+
+The API can send email notifications via AWS SES when embeddings are successfully created:
+
+- **Trigger**: Sent after successful Nhost insertion and Spaces upload
+- **Content**: Includes filename, user ID, user display name, and PDF embedding ID
+- **Format**: Both plain text and HTML versions
+- **Error Handling**: Gracefully handles missing configuration or SES errors
+
+**Email Content:**
+- **Subject**: "PDF Embedding Created: {filename}"
+- **Body**: File name, User ID, User Display Name, PDF Embedding ID
+
+**Configuration:**
+Set the following environment variables:
+- `AWS_SES_REGION`: AWS region (default: `us-east-1`)
+- `AWS_ACCESS_KEY_ID`: AWS access key
+- `AWS_SECRET_ACCESS_KEY`: AWS secret key
+- `AWS_SES_FROM_EMAIL`: Verified sender email in SES
+- `AWS_SES_TO_EMAIL`: Recipient email address
+
+**Note**: The sender email must be verified in AWS SES before use.
 
 ## Webhook Integration
 
@@ -497,13 +589,14 @@ When `send_webhook=true`, the API sends a POST request to `WEBHOOK_URL` when pro
 
 ## Dependencies
 
-- `pdfplumber`: Advanced PDF text and table extraction
-- `PyPDF2`: PDF metadata and basic text extraction
-- `flask`: Web framework for API
-- `flask-cors`: CORS support for API
-- `python-dotenv`: Environment variable management
-- `gunicorn`: Production WSGI server (for deployment)
-- `requests`: HTTP library for Nhost/webhook integration
+- `pdfplumber>=0.10.0`: Advanced PDF text and table extraction
+- `PyPDF2>=3.0.0`: PDF metadata and basic text extraction, file validation
+- `flask>=3.0.0`: Web framework for API
+- `flask-cors>=4.0.0`: CORS support for API
+- `python-dotenv>=1.0.0`: Environment variable management
+- `gunicorn>=21.2.0`: Production WSGI server (for deployment)
+- `requests>=2.31.0`: HTTP library for Nhost/webhook integration
+- `boto3>=1.34.0`: AWS SDK for SES and S3-compatible storage
 
 ## Deployment
 
@@ -512,6 +605,25 @@ See `DEPLOYMENT.md` for detailed deployment instructions for:
 - AWS EC2
 - Render
 - Other platforms
+
+### Railway Deployment
+
+1. Connect your GitHub repository to Railway
+2. Set environment variables in Railway dashboard
+3. Railway will automatically detect the `Procfile` and deploy
+
+**Required Environment Variables for Railway:**
+- `NHOST_BACKEND_URL`
+- `NHOST_ADMIN_SECRET`
+- `DO_SPACES_URL` (if using Spaces)
+- `DO_SPACES_ID` (if using Spaces)
+- `DO_SPACES_SECRET` (if using Spaces)
+- `DO_SPACES_BUCKET` (if using Spaces)
+- `AWS_SES_REGION` (if using email notifications)
+- `AWS_ACCESS_KEY_ID` (if using email notifications)
+- `AWS_SECRET_ACCESS_KEY` (if using email notifications)
+- `AWS_SES_FROM_EMAIL` (if using email notifications)
+- `AWS_SES_TO_EMAIL` (if using email notifications)
 
 ## Limitations
 
@@ -524,11 +636,22 @@ See `DEPLOYMENT.md` for detailed deployment instructions for:
 ## Production Considerations
 
 1. **Job Storage**: Replace in-memory `jobs` dictionary with Redis for persistence
-2. **File Storage**: Consider using S3 or similar for temporary file storage
+2. **File Storage**: DigitalOcean Spaces integration is already implemented
 3. **Monitoring**: Add logging and monitoring for production
 4. **Rate Limiting**: Implement rate limiting for API endpoints
-5. **Error Handling**: Add retry logic for Nhost/webhook calls
+5. **Error Handling**: Retry logic is implemented for Nhost/webhook calls
 6. **Scaling**: Use multiple workers for concurrent processing
+7. **Email Verification**: Ensure sender email is verified in AWS SES
+8. **CORS**: Configure `CORS_ORIGINS` appropriately for production
+
+## Security Features
+
+- **File Type Validation**: Only PDF files are accepted
+- **Magic Byte Validation**: Verifies actual PDF file structure
+- **File Size Limits**: Prevents DoS attacks via large files
+- **Secure Filenames**: Uses `secure_filename()` to prevent path traversal
+- **CORS Configuration**: Configurable CORS origins
+- **Environment Variables**: Sensitive data stored in environment variables
 
 ## License
 

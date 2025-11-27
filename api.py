@@ -309,6 +309,7 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         file_url: Optional URL if file is stored in S3/storage
         upload_device: Device/platform used for upload (default: 'web')
         file_path: Optional path to local file for uploading to Spaces after embedding creation
+        user_display_name: Optional display name of the user for email notifications
     """
     if not NHOST_BACKEND_URL or not NHOST_ADMIN_SECRET:
         app.logger.warning("Nhost configuration missing, skipping Nhost integration")
@@ -792,7 +793,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
                 'message': 'Chunking text for embeddings...'
             }
             app.logger.info(f"Calling _send_to_nhost for job {job_id}, user_id: {user_id}, upload_device: {upload_device}")
-            user_display_name = request.form.get('user_display_name')
+            # user_display_name is already passed as a parameter to this function
             nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device, file_path=file_path, user_display_name=user_display_name)
             if nhost_result is None:
                 app.logger.warning(f"Failed to send data to Nhost for job {job_id}")
@@ -1075,7 +1076,8 @@ def extract_pdf():
             file_url = request.form.get('file_url')
             upload_device = request.form.get('upload_device', 'web')
             user_display_name = request.form.get('user_display_name')
-            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device, file_path=file_path, user_display_name=user_display_name)
+            # Synchronous endpoint doesn't save file to disk, so file_path is None
+            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device, file_path=None, user_display_name=user_display_name)
         
         response = {
             'success': True,
