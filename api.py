@@ -151,7 +151,7 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id):
         
         # Extract region from endpoint if possible (for boto3)
         # Default to 'nyc3' if can't determine
-        region = 'nyc3'  # Default
+        region = 'fra1'  # Default
         if 'nyc3' in endpoint_url.lower():
             region = 'nyc3'
         elif 'sgp1' in endpoint_url.lower():
@@ -606,17 +606,25 @@ def _send_email_notification(filename, user_id, user_display_name=None, pdf_embe
         user_display_name: Optional display name of the user
         pdf_embedding_id: Optional UUID of the pdf_embeddings record
     """
+    # Check if AWS SES is configured
     if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SES_FROM_EMAIL]):
-        app.logger.warning("AWS SES configuration missing, skipping email notification")
+        app.logger.debug("AWS SES configuration missing, skipping email notification")
+        return
+    
+    # Check if recipient email is configured
+    if not AWS_SES_TO_EMAIL:
+        app.logger.debug("AWS_SES_TO_EMAIL not set, skipping email notification")
         return
     
     try:
-        # Create SES client
+        # Create SES client with explicit credentials
+        # Note: Ensure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are correct
+        # and that the region matches where your SES is configured
         ses_client = boto3.client(
             'ses',
             region_name=AWS_SES_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+            aws_access_key_id=AWS_ACCESS_KEY_ID.strip() if AWS_ACCESS_KEY_ID else None,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY.strip() if AWS_SECRET_ACCESS_KEY else None
         )
         
         # Prepare email content
@@ -648,12 +656,8 @@ The PDF has been processed and embeddings have been created successfully.
 </html>
 """
         
-        # Determine recipient email
-        # If AWS_SES_TO_EMAIL is set, use it; otherwise, you might want to fetch user email from database
-        to_email = AWS_SES_TO_EMAIL
-        if not to_email:
-            app.logger.warning("AWS_SES_TO_EMAIL not set, skipping email notification")
-            return
+        # Use configured recipient email
+        to_email = AWS_SES_TO_EMAIL.strip()
         
         # Send email
         response = ses_client.send_email(
@@ -682,9 +686,22 @@ The PDF has been processed and embeddings have been created successfully.
         app.logger.info(f"Email notification sent successfully. MessageId: {response.get('MessageId')}")
         
     except ClientError as e:
-        app.logger.error(f"Error sending email via SES: {str(e)}")
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_message = e.response.get('Error', {}).get('Message', str(e))
+        
+        if error_code == 'SignatureDoesNotMatch':
+            app.logger.error(f"AWS SES authentication error: {error_message}")
+            app.logger.error("Please verify your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are correct")
+            app.logger.error(f"Region: {AWS_SES_REGION}, From: {AWS_SES_FROM_EMAIL}")
+        elif error_code == 'MessageRejected':
+            app.logger.error(f"AWS SES message rejected: {error_message}")
+            app.logger.error("Please verify that AWS_SES_FROM_EMAIL is verified in SES")
+        else:
+            app.logger.error(f"AWS SES error ({error_code}): {error_message}")
+        # Don't raise - email failure shouldn't break the main process
     except Exception as e:
         app.logger.error(f"Unexpected error sending email: {str(e)}")
+        # Don't raise - email failure shouldn't break the main process
 
 
 def _send_webhook(job_id, status, data=None, error=None):
