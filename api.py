@@ -64,7 +64,7 @@ DO_SPACES_BUCKET = os.environ.get('DO_SPACES_BUCKET', '')
 DO_SPACES_FOLDER = 'docs_pdf_embedding_sources'  # Folder name in Spaces
 
 # AWS SES (Simple Email Service) configuration
-AWS_SES_REGION = os.environ.get('AWS_SES_REGION', 'us-east-1')
+AWS_SES_REGION = os.environ.get('AWS_SES_REGION', 'eu-central-1')
 AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID', '')
 AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
 AWS_SES_FROM_EMAIL = os.environ.get('AWS_SES_FROM_EMAIL', '')  # Verified sender email in SES
