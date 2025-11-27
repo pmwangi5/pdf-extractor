@@ -26,6 +26,8 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import requests
+import boto3
+from botocore.exceptions import ClientError
 from pdf_extractor import PDFExtractor
 
 # Load environment variables
@@ -54,6 +56,20 @@ NHOST_GRAPHQL_URL = os.environ.get('NHOST_GRAPHQL_URL', '')
 # This is called when PDF processing completes (success or failure)
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
 
+# DigitalOcean Spaces (S3-compatible) configuration
+DO_SPACES_URL = os.environ.get('DO_SPACES_URL', '')  # Full URL or endpoint, e.g., https://nyc3.digitaloceanspaces.com or nyc3.digitaloceanspaces.com
+DO_SPACES_ID = os.environ.get('DO_SPACES_ID', '')  # Access key ID
+DO_SPACES_SECRET = os.environ.get('DO_SPACES_SECRET', '')  # Secret access key
+DO_SPACES_BUCKET = os.environ.get('DO_SPACES_BUCKET', '')
+DO_SPACES_FOLDER = 'docs_pdf_embedding_sources'  # Folder name in Spaces
+
+# AWS SES (Simple Email Service) configuration
+AWS_SES_REGION = os.environ.get('AWS_SES_REGION', 'us-east-1')
+AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID', '')
+AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+AWS_SES_FROM_EMAIL = os.environ.get('AWS_SES_FROM_EMAIL', '')  # Verified sender email in SES
+AWS_SES_TO_EMAIL = os.environ.get('AWS_SES_TO_EMAIL', '')  # Optional: Default recipient email
+
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
@@ -64,6 +80,134 @@ jobs = {}
 def allowed_file(filename):
     """Check if file extension is allowed."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def validate_pdf_file(file_path):
+    """
+    Validate that the file is actually a PDF by checking magic bytes.
+    This prevents malicious files from being uploaded even if they have .pdf extension.
+    
+    Args:
+        file_path: Path to the file to validate
+    
+    Returns:
+        Tuple of (is_valid: bool, error_message: str)
+    """
+    try:
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            return False, "File is empty"
+        
+        if file_size > MAX_FILE_SIZE:
+            return False, f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / (1024*1024)}MB"
+        
+        # Read first 4 bytes to check PDF magic number
+        # PDF files start with %PDF (hex: 25 50 44 46)
+        with open(file_path, 'rb') as f:
+            header = f.read(4)
+            
+        # Check for PDF magic bytes
+        if header != b'%PDF':
+            return False, "File is not a valid PDF (invalid magic bytes)"
+        
+        # Additional validation: Try to open with PyPDF2 to ensure it's a valid PDF
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(file_path)
+            # Try to get page count to ensure PDF is readable
+            _ = len(reader.pages)
+        except Exception as e:
+            return False, f"File appears to be corrupted or not a valid PDF: {str(e)}"
+        
+        return True, None
+        
+    except Exception as e:
+        return False, f"Error validating file: {str(e)}"
+
+
+def upload_to_spaces(file_path, filename, pdf_embedding_id):
+    """
+    Upload PDF file to DigitalOcean Spaces (S3-compatible storage).
+    
+    Args:
+        file_path: Local path to the PDF file
+        filename: Original filename
+        pdf_embedding_id: UUID of the pdf_embeddings record
+    
+    Returns:
+        Public URL of the uploaded file, or None if upload failed
+    """
+    if not all([DO_SPACES_URL, DO_SPACES_ID, DO_SPACES_SECRET, DO_SPACES_BUCKET]):
+        app.logger.warning("DigitalOcean Spaces configuration missing, skipping file upload")
+        return None
+    
+    try:
+        # Parse DO_SPACES_URL - handle both full URL and endpoint formats
+        # e.g., "https://nyc3.digitaloceanspaces.com" or "nyc3.digitaloceanspaces.com"
+        endpoint_url = DO_SPACES_URL
+        if not endpoint_url.startswith('http'):
+            endpoint_url = f'https://{endpoint_url}'
+        
+        # Extract region from endpoint if possible (for boto3)
+        # Default to 'nyc3' if can't determine
+        region = 'nyc3'  # Default
+        if 'nyc3' in endpoint_url.lower():
+            region = 'nyc3'
+        elif 'sgp1' in endpoint_url.lower():
+            region = 'sgp1'
+        elif 'ams3' in endpoint_url.lower():
+            region = 'ams3'
+        elif 'sfo3' in endpoint_url.lower():
+            region = 'sfo3'
+        elif 'fra1' in endpoint_url.lower():
+            region = 'fra1'
+        
+        # Create S3 client for DigitalOcean Spaces
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=DO_SPACES_ID,
+            aws_secret_access_key=DO_SPACES_SECRET,
+            region_name=region
+        )
+        
+        # Create secure filename with embedding ID
+        # Format: docs_pdf_embedding_sources/{pdf_embedding_id}/{secure_filename}
+        secure_name = secure_filename(filename)
+        s3_key = f"{DO_SPACES_FOLDER}/{pdf_embedding_id}/{secure_name}"
+        
+        app.logger.info(f"Uploading file to Spaces: {s3_key}")
+        
+        # Upload file with private ACL (change to 'public-read' if you want public access)
+        s3_client.upload_file(
+            file_path,
+            DO_SPACES_BUCKET,
+            s3_key,
+            ExtraArgs={
+                'ContentType': 'application/pdf',
+                'ACL': 'private'  # Change to 'public-read' if you want public access
+            }
+        )
+        
+        # Construct public URL
+        # Format: https://{bucket}.{endpoint}/{key}
+        # Extract endpoint hostname from URL
+        from urllib.parse import urlparse
+        parsed_url = urlparse(endpoint_url)
+        endpoint_host = parsed_url.netloc or parsed_url.path.replace('https://', '').replace('http://', '')
+        
+        file_url = f"https://{DO_SPACES_BUCKET}.{endpoint_host}/{s3_key}"
+        
+        app.logger.info(f"Successfully uploaded file to Spaces: {file_url}")
+        return file_url
+        
+    except ClientError as e:
+        app.logger.error(f"Error uploading to Spaces: {str(e)}")
+        return None
+    except Exception as e:
+        app.logger.error(f"Unexpected error uploading to Spaces: {str(e)}")
+        return None
 
 
 def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
@@ -151,7 +295,7 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
     return chunks
 
 
-def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_url=None, upload_device="web"):
+def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_url=None, upload_device="web", file_path=None, user_display_name=None):
     """
     Send extracted data to Nhost for embeddings.
     For large PDFs, chunks text intelligently for better embedding generation.
@@ -164,6 +308,7 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         jobs_dict: Optional jobs dictionary for progress updates
         file_url: Optional URL if file is stored in S3/storage
         upload_device: Device/platform used for upload (default: 'web')
+        file_path: Optional path to local file for uploading to Spaces after embedding creation
     """
     if not NHOST_BACKEND_URL or not NHOST_ADMIN_SECRET:
         app.logger.warning("Nhost configuration missing, skipping Nhost integration")
@@ -300,6 +445,22 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
                     else:
                         app.logger.warning(f"Failed to create subscriber entry for user {user_id} and embedding {pdf_embedding_id}")
                 
+                # Upload PDF to DigitalOcean Spaces after successful embedding creation
+                spaces_url = None
+                if file_path and os.path.exists(file_path) and pdf_embedding_id:
+                    app.logger.info(f"Uploading PDF to Spaces for embedding {pdf_embedding_id}")
+                    spaces_url = upload_to_spaces(file_path, filename, pdf_embedding_id)
+                    
+                    # Update file_url in database if upload was successful
+                    if spaces_url:
+                        _update_file_url(pdf_embedding_id, spaces_url, graphql_url, headers)
+                elif not file_path:
+                    app.logger.debug("file_path not provided, skipping Spaces upload")
+                
+                # Send email notification after successful embedding creation
+                if user_id:
+                    _send_email_notification(filename, user_id, user_display_name, pdf_embedding_id)
+                
                 return result.get('data', {})
             else:
                 app.logger.warning(f"Unexpected response structure: {result}")
@@ -388,6 +549,143 @@ def _create_subscriber_entry(pdf_embedding_id, user_id, graphql_url, headers):
         return None
 
 
+def _update_file_url(pdf_embedding_id, file_url, graphql_url, headers):
+    """
+    Update the file_url field in pdf_embeddings table after successful Spaces upload.
+    
+    Args:
+        pdf_embedding_id: UUID of the pdf_embeddings record
+        file_url: URL of the file in Spaces
+        graphql_url: Nhost GraphQL endpoint URL
+        headers: Request headers with admin secret
+    """
+    try:
+        mutation = {
+            "query": """
+                mutation UpdatePDFEmbeddingFileUrl($id: uuid!, $file_url: String!) {
+                    update_pdf_embeddings_by_pk(pk_columns: {id: $id}, _set: {file_url: $file_url}) {
+                        id
+                        file_url
+                    }
+                }
+            """,
+            "variables": {
+                "id": pdf_embedding_id,
+                "file_url": file_url
+            }
+        }
+        
+        response = requests.post(
+            graphql_url,
+            json=mutation,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if 'errors' not in result:
+                app.logger.info(f"Updated file_url for embedding {pdf_embedding_id}")
+            else:
+                app.logger.warning(f"Error updating file_url: {result.get('errors')}")
+        else:
+            app.logger.warning(f"Failed to update file_url: {response.status_code}")
+            
+    except Exception as e:
+        app.logger.error(f"Error updating file_url: {str(e)}")
+
+
+def _send_email_notification(filename, user_id, user_display_name=None, pdf_embedding_id=None):
+    """
+    Send email notification using AWS SES after successful PDF embedding creation.
+    
+    Args:
+        filename: Name of the PDF file
+        user_id: UUID of the user
+        user_display_name: Optional display name of the user
+        pdf_embedding_id: Optional UUID of the pdf_embeddings record
+    """
+    if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SES_FROM_EMAIL]):
+        app.logger.warning("AWS SES configuration missing, skipping email notification")
+        return
+    
+    try:
+        # Create SES client
+        ses_client = boto3.client(
+            'ses',
+            region_name=AWS_SES_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        )
+        
+        # Prepare email content
+        subject = f"PDF Embedding Created: {filename}"
+        
+        # Build email body
+        body_text = f"""
+PDF Embedding Successfully Created
+
+File Name: {filename}
+User ID: {user_id}
+User Display Name: {user_display_name or 'Not provided'}
+PDF Embedding ID: {pdf_embedding_id or 'N/A'}
+
+The PDF has been processed and embeddings have been created successfully.
+"""
+        
+        body_html = f"""
+<html>
+<head></head>
+<body>
+  <h2>PDF Embedding Successfully Created</h2>
+  <p><strong>File Name:</strong> {filename}</p>
+  <p><strong>User ID:</strong> {user_id}</p>
+  <p><strong>User Display Name:</strong> {user_display_name or 'Not provided'}</p>
+  <p><strong>PDF Embedding ID:</strong> {pdf_embedding_id or 'N/A'}</p>
+  <p>The PDF has been processed and embeddings have been created successfully.</p>
+</body>
+</html>
+"""
+        
+        # Determine recipient email
+        # If AWS_SES_TO_EMAIL is set, use it; otherwise, you might want to fetch user email from database
+        to_email = AWS_SES_TO_EMAIL
+        if not to_email:
+            app.logger.warning("AWS_SES_TO_EMAIL not set, skipping email notification")
+            return
+        
+        # Send email
+        response = ses_client.send_email(
+            Source=AWS_SES_FROM_EMAIL,
+            Destination={
+                'ToAddresses': [to_email]
+            },
+            Message={
+                'Subject': {
+                    'Data': subject,
+                    'Charset': 'UTF-8'
+                },
+                'Body': {
+                    'Text': {
+                        'Data': body_text,
+                        'Charset': 'UTF-8'
+                    },
+                    'Html': {
+                        'Data': body_html,
+                        'Charset': 'UTF-8'
+                    }
+                }
+            }
+        )
+        
+        app.logger.info(f"Email notification sent successfully. MessageId: {response.get('MessageId')}")
+        
+    except ClientError as e:
+        app.logger.error(f"Error sending email via SES: {str(e)}")
+    except Exception as e:
+        app.logger.error(f"Unexpected error sending email: {str(e)}")
+
+
 def _send_webhook(job_id, status, data=None, error=None):
     """
     Send webhook notification to Next.js app.
@@ -431,7 +729,7 @@ def _send_webhook(job_id, status, data=None, error=None):
 
 def _process_extraction_async(file_path, original_filename, job_id, extract_type='all', pages=None, 
                               include_tables=True, send_to_nhost=True, 
-                              send_webhook=True, user_id=None, file_url=None, upload_device="web"):
+                              send_webhook=True, user_id=None, file_url=None, upload_device="web", user_display_name=None):
     """
     Process PDF extraction asynchronously.
     Optimized for large PDFs (800+ pages) with progress updates.
@@ -494,7 +792,8 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
                 'message': 'Chunking text for embeddings...'
             }
             app.logger.info(f"Calling _send_to_nhost for job {job_id}, user_id: {user_id}, upload_device: {upload_device}")
-            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device)
+            user_display_name = request.form.get('user_display_name')
+            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device, file_path=file_path, user_display_name=user_display_name)
             if nhost_result is None:
                 app.logger.warning(f"Failed to send data to Nhost for job {job_id}")
             else:
@@ -775,7 +1074,8 @@ def extract_pdf():
             user_id = request.form.get('user_id')
             file_url = request.form.get('file_url')
             upload_device = request.form.get('upload_device', 'web')
-            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device)
+            user_display_name = request.form.get('user_display_name')
+            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device, file_path=file_path, user_display_name=user_display_name)
         
         response = {
             'success': True,
@@ -857,6 +1157,7 @@ def extract_pdf_async():
         user_id = request.form.get('user_id')
         file_url = request.form.get('file_url')  # Optional: URL if file is in S3/storage
         upload_device = request.form.get('upload_device', 'web')  # Required: Device/platform from form upload
+        user_display_name = request.form.get('user_display_name')  # Optional: User display name for email notifications
         
         # Parse page numbers
         pages = None
@@ -884,7 +1185,7 @@ def extract_pdf_async():
         # Start async processing with file path instead of file object
         thread = threading.Thread(
             target=_process_extraction_async,
-            args=(temp_path, filename, job_id, extract_type, pages, include_tables, send_to_nhost, send_webhook, user_id, file_url, upload_device)
+            args=(temp_path, filename, job_id, extract_type, pages, include_tables, send_to_nhost, send_webhook, user_id, file_url, upload_device, user_display_name)
         )
         thread.daemon = True
         thread.start()
