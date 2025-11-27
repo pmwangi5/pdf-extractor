@@ -143,14 +143,24 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id):
         return None
     
     try:
+        # Verify file exists before attempting upload
+        if not os.path.exists(file_path):
+            app.logger.error(f"File does not exist at path: {file_path}")
+            return None
+        
+        file_size = os.path.getsize(file_path)
+        app.logger.info(f"File exists, size: {file_size} bytes")
+        
         # Parse DO_SPACES_URL - handle both full URL and endpoint formats
         # e.g., "https://nyc3.digitaloceanspaces.com" or "nyc3.digitaloceanspaces.com"
-        endpoint_url = DO_SPACES_URL
+        endpoint_url = DO_SPACES_URL.strip()
         if not endpoint_url.startswith('http'):
             endpoint_url = f'https://{endpoint_url}'
         
+        app.logger.info(f"Spaces endpoint: {endpoint_url}, bucket: {DO_SPACES_BUCKET}")
+        
         # Extract region from endpoint if possible (for boto3)
-        # Default to 'nyc3' if can't determine
+        # Default to 'fra1' if can't determine
         region = 'fra1'  # Default
         if 'nyc3' in endpoint_url.lower():
             region = 'nyc3'
@@ -163,21 +173,25 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id):
         elif 'fra1' in endpoint_url.lower():
             region = 'fra1'
         
+        app.logger.info(f"Using region: {region}")
+        
         # Create S3 client for DigitalOcean Spaces
+        # Note: Strip credentials to remove any whitespace
         s3_client = boto3.client(
             's3',
             endpoint_url=endpoint_url,
-            aws_access_key_id=DO_SPACES_ID,
-            aws_secret_access_key=DO_SPACES_SECRET,
+            aws_access_key_id=DO_SPACES_ID.strip() if DO_SPACES_ID else None,
+            aws_secret_access_key=DO_SPACES_SECRET.strip() if DO_SPACES_SECRET else None,
             region_name=region
         )
         
         # Create secure filename with embedding ID
         # Format: docs_pdf_embedding_sources/{pdf_embedding_id}/{secure_filename}
+        # Note: Folders are created automatically in S3/Spaces - no need to create them manually
         secure_name = secure_filename(filename)
         s3_key = f"{DO_SPACES_FOLDER}/{pdf_embedding_id}/{secure_name}"
         
-        app.logger.info(f"Uploading file to Spaces: {s3_key}")
+        app.logger.info(f"Uploading file to Spaces: bucket={DO_SPACES_BUCKET}, key={s3_key}")
         
         # Upload file with private ACL (change to 'public-read' if you want public access)
         s3_client.upload_file(
@@ -203,10 +217,24 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id):
         return file_url
         
     except ClientError as e:
-        app.logger.error(f"Error uploading to Spaces: {str(e)}")
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_message = e.response.get('Error', {}).get('Message', str(e))
+        app.logger.error(f"DigitalOcean Spaces upload error ({error_code}): {error_message}")
+        
+        if error_code == 'NoSuchBucket':
+            app.logger.error(f"Bucket '{DO_SPACES_BUCKET}' does not exist. Please create it in DigitalOcean Spaces.")
+        elif error_code == 'AccessDenied':
+            app.logger.error("Access denied. Please verify DO_SPACES_ID and DO_SPACES_SECRET are correct.")
+        elif error_code == 'InvalidAccessKeyId':
+            app.logger.error("Invalid access key ID. Please verify DO_SPACES_ID is correct.")
+        elif error_code == 'SignatureDoesNotMatch':
+            app.logger.error("Signature mismatch. Please verify DO_SPACES_SECRET is correct.")
+        
         return None
     except Exception as e:
         app.logger.error(f"Unexpected error uploading to Spaces: {str(e)}")
+        import traceback
+        app.logger.error(traceback.format_exc())
         return None
 
 
@@ -448,15 +476,23 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
                 
                 # Upload PDF to DigitalOcean Spaces after successful embedding creation
                 spaces_url = None
-                if file_path and os.path.exists(file_path) and pdf_embedding_id:
-                    app.logger.info(f"Uploading PDF to Spaces for embedding {pdf_embedding_id}")
-                    spaces_url = upload_to_spaces(file_path, filename, pdf_embedding_id)
-                    
-                    # Update file_url in database if upload was successful
-                    if spaces_url:
-                        _update_file_url(pdf_embedding_id, spaces_url, graphql_url, headers)
+                if file_path and pdf_embedding_id:
+                    if os.path.exists(file_path):
+                        app.logger.info(f"Uploading PDF to Spaces for embedding {pdf_embedding_id}, file: {file_path}")
+                        spaces_url = upload_to_spaces(file_path, filename, pdf_embedding_id)
+                        
+                        # Update file_url in database if upload was successful
+                        if spaces_url:
+                            app.logger.info(f"Spaces upload successful, updating database with URL: {spaces_url}")
+                            _update_file_url(pdf_embedding_id, spaces_url, graphql_url, headers)
+                        else:
+                            app.logger.warning(f"Spaces upload failed for embedding {pdf_embedding_id}")
+                    else:
+                        app.logger.warning(f"File does not exist at path: {file_path}, skipping Spaces upload")
                 elif not file_path:
                     app.logger.debug("file_path not provided, skipping Spaces upload")
+                elif not pdf_embedding_id:
+                    app.logger.warning("pdf_embedding_id not available, skipping Spaces upload")
                 
                 # Send email notification after successful embedding creation
                 if user_id:
