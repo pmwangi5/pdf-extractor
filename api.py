@@ -288,8 +288,18 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
                 return None
             
             if 'data' in result and result.get('data', {}).get('insert_pdf_embeddings_one'):
+                pdf_embedding_id = result['data']['insert_pdf_embeddings_one'].get('id')
                 app.logger.info(f"Successfully sent data to Nhost for job {job_id}")
-                app.logger.info(f"Inserted record ID: {result['data']['insert_pdf_embeddings_one'].get('id')}")
+                app.logger.info(f"Inserted record ID: {pdf_embedding_id}")
+                
+                # Create subscriber entry if user_id is provided
+                if user_id and pdf_embedding_id:
+                    subscriber_result = _create_subscriber_entry(pdf_embedding_id, user_id, graphql_url, headers)
+                    if subscriber_result:
+                        app.logger.info(f"Created subscriber entry for user {user_id} and embedding {pdf_embedding_id}")
+                    else:
+                        app.logger.warning(f"Failed to create subscriber entry for user {user_id} and embedding {pdf_embedding_id}")
+                
                 return result.get('data', {})
             else:
                 app.logger.warning(f"Unexpected response structure: {result}")
@@ -306,6 +316,75 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
             
     except Exception as e:
         app.logger.error(f"Error sending to Nhost: {str(e)}")
+        return None
+
+
+def _create_subscriber_entry(pdf_embedding_id, user_id, graphql_url, headers):
+    """
+    Create a subscriber entry in pdf_embeddings_subscribers table.
+    
+    Args:
+        pdf_embedding_id: UUID of the pdf_embeddings record
+        user_id: UUID of the user
+        graphql_url: Nhost GraphQL endpoint URL
+        headers: Request headers with admin secret
+    
+    Returns:
+        Dictionary with subscriber data if successful, None otherwise
+    """
+    try:
+        mutation_object = {
+            "user_ID": user_id,  # Note: using user_ID as per table structure
+            "pdf_embedding_id": pdf_embedding_id,
+            "useCount": 0
+        }
+        
+        graphql_mutation = {
+            "query": """
+                mutation InsertPDFEmbeddingSubscriber($object: pdf_embeddings_subscribers_insert_input!) {
+                    insert_pdf_embeddings_subscribers_one(object: $object) {
+                        id
+                        user_ID
+                        pdf_embedding_id
+                        useCount
+                        created_at
+                    }
+                }
+            """,
+            "variables": {
+                "object": mutation_object
+            }
+        }
+        
+        app.logger.info(f"Creating subscriber entry for embedding {pdf_embedding_id} and user {user_id}")
+        
+        response = requests.post(
+            graphql_url,
+            json=graphql_mutation,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            if 'errors' in result:
+                app.logger.error(f"GraphQL errors creating subscriber: {result['errors']}")
+                return None
+            
+            if 'data' in result and result.get('data', {}).get('insert_pdf_embeddings_subscribers_one'):
+                subscriber_data = result['data']['insert_pdf_embeddings_subscribers_one']
+                app.logger.info(f"Successfully created subscriber entry: {subscriber_data.get('id')}")
+                return subscriber_data
+            else:
+                app.logger.warning(f"Unexpected subscriber response structure: {result}")
+                return None
+        else:
+            app.logger.error(f"Failed to create subscriber entry: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        app.logger.error(f"Error creating subscriber entry: {str(e)}")
         return None
 
 
