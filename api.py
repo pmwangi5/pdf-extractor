@@ -477,8 +477,10 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
                 # Upload PDF to DigitalOcean Spaces after successful embedding creation
                 spaces_url = None
                 if file_path and pdf_embedding_id:
+                    app.logger.info(f"Checking file for Spaces upload: {file_path}, exists: {os.path.exists(file_path) if file_path else False}")
                     if os.path.exists(file_path):
-                        app.logger.info(f"Uploading PDF to Spaces for embedding {pdf_embedding_id}, file: {file_path}")
+                        file_size = os.path.getsize(file_path)
+                        app.logger.info(f"Uploading PDF to Spaces for embedding {pdf_embedding_id}, file: {file_path} (size: {file_size} bytes)")
                         spaces_url = upload_to_spaces(file_path, filename, pdf_embedding_id)
                         
                         # Update file_url in database if upload was successful
@@ -817,15 +819,39 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             'message': 'Reading PDF file...'
         }
         
+        # Verify file still exists before processing
+        if not os.path.exists(file_path):
+            error_msg = f"File does not exist at path: {file_path}"
+            app.logger.error(error_msg)
+            jobs[job_id] = {'status': 'failed', 'error': error_msg, 'stage': 'failed'}
+            if send_webhook:
+                _send_webhook(job_id, 'failed', error=error_msg)
+            return
+        
+        app.logger.info(f"Processing PDF from path: {file_path} (exists: {os.path.exists(file_path)}, size: {os.path.getsize(file_path)} bytes)")
+        
         # Process extraction using file path with progress updates
         result, filename = _process_pdf_extraction_from_path(
             file_path, original_filename, extract_type, pages, include_tables, jobs, job_id
         )
         
+        # Verify file still exists after extraction (before Spaces upload)
+        if not os.path.exists(file_path):
+            app.logger.warning(f"File was deleted during extraction: {file_path}")
+        else:
+            app.logger.info(f"File still exists after extraction: {file_path} (size: {os.path.getsize(file_path)} bytes)")
+        
         if result is None:
             jobs[job_id] = {'status': 'failed', 'error': filename, 'stage': 'failed'}
             if send_webhook:
                 _send_webhook(job_id, 'failed', error=filename)
+            # Clean up file on failure
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    app.logger.debug(f"Cleaned up temporary file after failure: {file_path}")
+                except Exception:
+                    pass
             return
         
         # Update: Completed reading
@@ -858,6 +884,14 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
                 'stage': 'sending_to_db',
                 'message': 'Data sent to database successfully'
             }
+        
+        # Clean up temporary file after all processing is complete (including Spaces upload)
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                app.logger.debug(f"Cleaned up temporary file: {file_path}")
+            except Exception as e:
+                app.logger.warning(f"Failed to clean up temporary file {file_path}: {str(e)}")
         
         # Update job status - Done
         jobs[job_id] = {
@@ -993,13 +1027,7 @@ def _process_pdf_extraction_from_path(file_path, filename, extract_type='all', p
         
     except Exception as e:
         return None, str(e)
-    finally:
-        # Clean up temporary file
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass  # Ignore cleanup errors
+    # Note: File cleanup is handled in _process_extraction_async after Spaces upload
 
 
 @app.route('/', methods=['GET'])
@@ -1231,7 +1259,18 @@ def extract_pdf_async():
         
         try:
             file.save(temp_path)
+            # Verify file was saved
+            if os.path.exists(temp_path):
+                file_size = os.path.getsize(temp_path)
+                app.logger.info(f"File saved successfully: {temp_path} (size: {file_size} bytes)")
+            else:
+                app.logger.error(f"File save failed - file does not exist: {temp_path}")
+                return jsonify({
+                    'success': False,
+                    'error': 'Failed to save file to disk'
+                }), 500
         except Exception as e:
+            app.logger.error(f"Error saving file: {str(e)}")
             return jsonify({
                 'success': False,
                 'error': f'Failed to save file: {str(e)}'
