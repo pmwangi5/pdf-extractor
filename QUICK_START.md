@@ -12,6 +12,10 @@
    ```
    NHOST_BACKEND_URL=https://your-project.nhost.run
    NHOST_ADMIN_SECRET=your-admin-secret
+   DO_SPACES_URL=https://nyc3.digitaloceanspaces.com
+   DO_SPACES_ID=your-spaces-access-key-id
+   DO_SPACES_SECRET=your-spaces-secret-key
+   DO_SPACES_BUCKET=your-bucket-name
    WEBHOOK_URL=https://your-nextjs-app.vercel.app/api/webhook/pdf-extraction
    CORS_ORIGINS=https://your-nextjs-app.vercel.app
    ```

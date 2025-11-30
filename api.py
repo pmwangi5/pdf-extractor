@@ -30,6 +30,18 @@ import boto3
 from botocore.exceptions import ClientError
 from pdf_extractor import PDFExtractor
 
+# Try to import pdf2image for PDF to JPG conversion
+try:
+    from pdf2image import convert_from_path
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    try:
+        from pdf2image import convert_from_bytes
+        PDF2IMAGE_AVAILABLE = True
+    except ImportError:
+        PDF2IMAGE_AVAILABLE = False
+        # Logger will be available after app is created
+
 # Load environment variables
 load_dotenv()
 
@@ -126,14 +138,66 @@ def validate_pdf_file(file_path):
         return False, f"Error validating file: {str(e)}"
 
 
-def upload_to_spaces(file_path, filename, pdf_embedding_id):
+def convert_pdf_first_page_to_jpg(pdf_path, output_path=None):
     """
-    Upload PDF file to DigitalOcean Spaces (S3-compatible storage).
+    Convert the first page of a PDF to a JPG image.
     
     Args:
-        file_path: Local path to the PDF file
-        filename: Original filename
+        pdf_path: Path to the PDF file
+        output_path: Optional path to save the JPG. If None, saves to temp directory.
+    
+    Returns:
+        Path to the created JPG file, or None if conversion failed
+    """
+    if not PDF2IMAGE_AVAILABLE:
+        try:
+            app.logger.warning("pdf2image not available, skipping PDF to JPG conversion. Install with: pip install pdf2image")
+        except:
+            print("pdf2image not available, skipping PDF to JPG conversion. Install with: pip install pdf2image")
+        return None
+    
+    if not os.path.exists(pdf_path):
+        app.logger.error(f"PDF file does not exist: {pdf_path}")
+        return None
+    
+    try:
+        # Generate output path if not provided
+        if output_path is None:
+            base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+            output_dir = os.path.dirname(pdf_path)
+            output_path = os.path.join(output_dir, f"{base_name}_preview.jpg")
+        
+        app.logger.info(f"Converting first page of PDF to JPG: {pdf_path}")
+        
+        # Convert first page only (pages parameter is 1-indexed, so [0] is first page)
+        images = convert_from_path(pdf_path, first_page=1, last_page=1, dpi=150)
+        
+        if not images:
+            app.logger.error("No images generated from PDF")
+            return None
+        
+        # Save the first (and only) image as JPG
+        images[0].save(output_path, 'JPEG', quality=85)
+        app.logger.info(f"Successfully converted PDF first page to JPG: {output_path}")
+        
+        return output_path
+        
+    except Exception as e:
+        app.logger.error(f"Error converting PDF to JPG: {str(e)}")
+        import traceback
+        app.logger.error(traceback.format_exc())
+        return None
+
+
+def upload_to_spaces(file_path, filename, pdf_embedding_id, content_type='application/pdf'):
+    """
+    Upload file to DigitalOcean Spaces (S3-compatible storage).
+    
+    Args:
+        file_path: Local path to the file
+        filename: Original filename (or desired filename)
         pdf_embedding_id: UUID of the pdf_embeddings record
+        content_type: MIME type of the file (default: 'application/pdf')
     
     Returns:
         Public URL of the uploaded file, or None if upload failed
@@ -199,7 +263,7 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id):
             DO_SPACES_BUCKET,
             s3_key,
             ExtraArgs={
-                'ContentType': 'application/pdf',
+                'ContentType': content_type,
                 'ACL': 'private'  # Change to 'public-read' if you want public access
             }
         )
@@ -399,7 +463,7 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         
         # Build mutation object matching Nhost table structure
         # Table: pdf_embeddings
-        # Columns: id (auto), created_at (auto), job_id, user_id, file_url, metadata, 
+        # Columns: id (auto), created_at (auto), job_id, user_id, file_url, pdf_jpg, metadata, 
         #          text_content, text_by_page, text_chunks, chunk_count, tables, 
         #          status, nhost_embedding_id (optional), upload_device
         mutation_object = {
@@ -412,6 +476,7 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
             "tables": payload['tables'],
             "status": "ready_for_embedding",
             "file_url": file_url,  # Can be set if file is stored in S3/storage (nullable)
+            "pdf_jpg": None,  # Will be updated after JPG conversion and upload
             "upload_device": upload_device  # Required: Device/platform from form upload
         }
         
@@ -476,17 +541,43 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
                 
                 # Upload PDF to DigitalOcean Spaces after successful embedding creation
                 spaces_url = None
+                jpg_url = None
                 if file_path and pdf_embedding_id:
                     app.logger.info(f"Checking file for Spaces upload: {file_path}, exists: {os.path.exists(file_path) if file_path else False}")
                     if os.path.exists(file_path):
                         file_size = os.path.getsize(file_path)
                         app.logger.info(f"Uploading PDF to Spaces for embedding {pdf_embedding_id}, file: {file_path} (size: {file_size} bytes)")
-                        spaces_url = upload_to_spaces(file_path, filename, pdf_embedding_id)
+                        spaces_url = upload_to_spaces(file_path, filename, pdf_embedding_id, content_type='application/pdf')
                         
                         # Update file_url in database if upload was successful
                         if spaces_url:
                             app.logger.info(f"Spaces upload successful, updating database with URL: {spaces_url}")
                             _update_file_url(pdf_embedding_id, spaces_url, graphql_url, headers)
+                            
+                            # Convert first page to JPG and upload
+                            app.logger.info(f"Converting first page of PDF to JPG for embedding {pdf_embedding_id}")
+                            jpg_path = convert_pdf_first_page_to_jpg(file_path)
+                            
+                            if jpg_path and os.path.exists(jpg_path):
+                                # Generate JPG filename
+                                jpg_filename = os.path.splitext(secure_filename(filename))[0] + "_preview.jpg"
+                                app.logger.info(f"Uploading JPG preview to Spaces: {jpg_path}")
+                                jpg_url = upload_to_spaces(jpg_path, jpg_filename, pdf_embedding_id, content_type='image/jpeg')
+                                
+                                if jpg_url:
+                                    app.logger.info(f"JPG upload successful, updating database with URL: {jpg_url}")
+                                    _update_pdf_jpg(pdf_embedding_id, jpg_url, graphql_url, headers)
+                                    
+                                    # Clean up temporary JPG file
+                                    try:
+                                        os.remove(jpg_path)
+                                        app.logger.debug(f"Cleaned up temporary JPG file: {jpg_path}")
+                                    except Exception as cleanup_error:
+                                        app.logger.warning(f"Failed to clean up JPG file {jpg_path}: {str(cleanup_error)}")
+                                else:
+                                    app.logger.warning(f"JPG upload failed for embedding {pdf_embedding_id}")
+                            else:
+                                app.logger.warning(f"PDF to JPG conversion failed for embedding {pdf_embedding_id}")
                         else:
                             app.logger.warning(f"Spaces upload failed for embedding {pdf_embedding_id}")
                     else:
@@ -632,6 +723,52 @@ def _update_file_url(pdf_embedding_id, file_url, graphql_url, headers):
             
     except Exception as e:
         app.logger.error(f"Error updating file_url: {str(e)}")
+
+
+def _update_pdf_jpg(pdf_embedding_id, pdf_jpg_url, graphql_url, headers):
+    """
+    Update the pdf_jpg field in pdf_embeddings table after successful JPG upload.
+    
+    Args:
+        pdf_embedding_id: UUID of the pdf_embeddings record
+        pdf_jpg_url: URL of the JPG file in Spaces
+        graphql_url: Nhost GraphQL endpoint URL
+        headers: Request headers with admin secret
+    """
+    try:
+        mutation = {
+            "query": """
+                mutation UpdatePDFEmbeddingJpg($id: uuid!, $pdf_jpg: String!) {
+                    update_pdf_embeddings_by_pk(pk_columns: {id: $id}, _set: {pdf_jpg: $pdf_jpg}) {
+                        id
+                        pdf_jpg
+                    }
+                }
+            """,
+            "variables": {
+                "id": pdf_embedding_id,
+                "pdf_jpg": pdf_jpg_url
+            }
+        }
+        
+        response = requests.post(
+            graphql_url,
+            json=mutation,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if 'errors' not in result:
+                app.logger.info(f"Updated pdf_jpg for embedding {pdf_embedding_id}")
+            else:
+                app.logger.warning(f"Error updating pdf_jpg: {result.get('errors')}")
+        else:
+            app.logger.warning(f"Failed to update pdf_jpg: {response.status_code}")
+            
+    except Exception as e:
+        app.logger.error(f"Error updating pdf_jpg: {str(e)}")
 
 
 def _send_email_notification(filename, user_id, user_display_name=None, pdf_embedding_id=None):

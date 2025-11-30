@@ -56,31 +56,41 @@ For your use case with Next.js and Nhost, I recommend **Railway** or **Render** 
 
 ### Step 1: Prepare Your Code
 
-1. Create a `Procfile`:
-```
-web: gunicorn api:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
-```
+The repository includes:
+- ✅ `Dockerfile` - Automatically installs Poppler (required for PDF to JPG conversion)
+- ✅ `Procfile` - For buildpack-based deployment (alternative to Dockerfile)
+- ✅ `requirements.txt` - Includes `pdf2image` for PDF preview generation
 
-2. Update `requirements.txt` (already done)
-
-3. Create `runtime.txt` (optional, for specific Python version):
-```
-python-3.11.0
-```
+**Note**: The `Dockerfile` is recommended as it ensures Poppler is installed. Railway will automatically use it if present.
 
 ### Step 2: Deploy to Railway
 
 1. Sign up at [railway.app](https://railway.app)
 2. Click "New Project" → "Deploy from GitHub repo"
 3. Connect your repository
-4. Railway auto-detects Python and installs dependencies
+4. Railway will detect the `Dockerfile` and use it (or auto-detect Python if using buildpacks)
 5. Add environment variables:
+   
+   **Required:**
    - `NHOST_BACKEND_URL`: Your Nhost backend URL
    - `NHOST_ADMIN_SECRET`: Your Nhost admin secret (for server-side operations)
-   - `WEBHOOK_URL`: (Optional) Your Next.js webhook endpoint for completion callbacks
+   - `DO_SPACES_URL`: DigitalOcean Spaces endpoint (e.g., `https://nyc3.digitaloceanspaces.com` or `nyc3.digitaloceanspaces.com`)
+   - `DO_SPACES_ID`: DigitalOcean Spaces access key ID (for PDF/JPG uploads)
+   - `DO_SPACES_SECRET`: DigitalOcean Spaces secret access key
+   - `DO_SPACES_BUCKET`: Your DigitalOcean Spaces bucket name
+   
+   **Optional:**
+   - `WEBHOOK_URL`: Your Next.js webhook endpoint for completion callbacks
+   - `AWS_ACCESS_KEY_ID`: AWS access key for SES email notifications
+   - `AWS_SECRET_ACCESS_KEY`: AWS secret key for SES email notifications
+   - `AWS_SES_REGION`: AWS SES region (defaults to `eu-central-1`)
+   - `AWS_SES_FROM_EMAIL`: Verified sender email in SES
+   - `AWS_SES_TO_EMAIL`: Default recipient email
    - `PORT`: Railway sets this automatically
 
 6. Deploy! Your API will be live at `https://your-app.railway.app`
+
+**System Dependencies**: The Dockerfile automatically installs `poppler-utils`, which is required for PDF to JPG conversion. No manual installation needed!
 
 ### Step 3: Test Your Deployment
 
@@ -143,11 +153,27 @@ nano .env
 
 Add to `.env`:
 ```
+# Required
 NHOST_BACKEND_URL=https://your-project.nhost.run
 NHOST_ADMIN_SECRET=your-admin-secret
+
+# DigitalOcean Spaces (for PDF/JPG uploads)
+DO_SPACES_URL=https://nyc3.digitaloceanspaces.com
+DO_SPACES_ID=your-spaces-access-key-id
+DO_SPACES_SECRET=your-spaces-secret-key
+DO_SPACES_BUCKET=your-bucket-name
+
+# Optional
 WEBHOOK_URL=https://your-nextjs-app.com/api/webhook
 FLASK_DEBUG=False
 PORT=5000
+
+# AWS SES (optional - for email notifications)
+AWS_ACCESS_KEY_ID=your-aws-access-key
+AWS_SECRET_ACCESS_KEY=your-aws-secret-key
+AWS_SES_REGION=eu-central-1
+AWS_SES_FROM_EMAIL=noreply@yourdomain.com
+AWS_SES_TO_EMAIL=admin@yourdomain.com
 ```
 
 ### Step 4: Create Systemd Service
@@ -234,12 +260,38 @@ sudo ufw enable
 
 Set these in your deployment platform:
 
+### Required for Core Functionality
+
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `NHOST_BACKEND_URL` | Your Nhost backend URL (e.g., `https://xxx.nhost.run`) | Yes |
 | `NHOST_ADMIN_SECRET` | Nhost admin secret for server-side operations | Yes |
+
+### DigitalOcean Spaces (S3-compatible) - For PDF/JPG File Storage
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `DO_SPACES_URL` | DigitalOcean Spaces endpoint (e.g., `https://nyc3.digitaloceanspaces.com` or `nyc3.digitaloceanspaces.com`) | Yes (for PDF/JPG uploads) |
+| `DO_SPACES_ID` | DigitalOcean Spaces access key ID | Yes (for PDF/JPG uploads) |
+| `DO_SPACES_SECRET` | DigitalOcean Spaces secret access key | Yes (for PDF/JPG uploads) |
+| `DO_SPACES_BUCKET` | DigitalOcean Spaces bucket name | Yes (for PDF/JPG uploads) |
+
+### AWS SES (Simple Email Service) - For Email Notifications
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `AWS_ACCESS_KEY_ID` | AWS access key ID for SES | No (only if using email notifications) |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret access key for SES | No (only if using email notifications) |
+| `AWS_SES_REGION` | AWS SES region (e.g., `eu-central-1`, `us-east-1`) | No (defaults to `eu-central-1`) |
+| `AWS_SES_FROM_EMAIL` | Verified sender email address in SES | No (only if using email notifications) |
+| `AWS_SES_TO_EMAIL` | Default recipient email address | No (optional) |
+
+### Optional Configuration
+
+| Variable | Description | Required |
+|----------|-------------|----------|
 | `WEBHOOK_URL` | Next.js webhook endpoint for completion callbacks | No |
-| `PORT` | Port to run the server (usually auto-set) | Auto |
+| `PORT` | Port to run the server (usually auto-set by platform) | Auto |
 | `FLASK_DEBUG` | Debug mode (set to `False` in production) | No |
 | `CORS_ORIGINS` | Comma-separated allowed origins (e.g., `https://your-app.com,https://app.vercel.app`) | No |
 
