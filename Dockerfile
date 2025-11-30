@@ -19,10 +19,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Make startup script executable
+RUN chmod +x start.sh
+
 # Expose port (default to 5000, Railway will set PORT env var at runtime)
 EXPOSE 5000
 
-# Use gunicorn to run the Flask app
-# Railway will set PORT env var, so we use sh -c to properly expand it
-CMD sh -c "gunicorn api:app --bind 0.0.0.0:${PORT:-5000} --workers 2 --timeout 120 --access-logfile - --error-logfile -"
+# Use startup script to handle PORT variable
+CMD ["./start.sh"]
 
