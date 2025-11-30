@@ -25,6 +25,6 @@ RUN chmod +x start.sh
 # Expose port (default to 5000, Railway will set PORT env var at runtime)
 EXPOSE 5000
 
-# Use startup script to handle PORT variable
-CMD ["./start.sh"]
+# Use startup script to handle PORT variable (use shell form to execute bash script)
+CMD ./start.sh
 
