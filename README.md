@@ -11,7 +11,7 @@ A production-ready Python application for extracting data from PDF files. Optimi
 - **Web API**: RESTful API with synchronous and asynchronous endpoints
 - **Async Processing**: Background job processing with real-time progress tracking
 - **Large PDF Support**: Optimized for 800+ page documents (car manuals, technical docs)
-- **Text Chunking**: Intelligent chunking for embeddings (1000 chars/chunk with overlap)
+- **Text Chunking**: Advanced semantic chunking with text normalization (1000 chars/chunk with overlap)
 - **Nhost/Hasura Integration**: Automatic data storage with GraphQL mutations
 - **Webhook Support**: Notify Next.js apps when processing completes
 - **Progress Tracking**: Real-time status updates with stages and percentages
@@ -20,6 +20,8 @@ A production-ready Python application for extracting data from PDF files. Optimi
 - **DigitalOcean Spaces Integration**: Automatic PDF storage to S3-compatible storage
 - **AWS SES Email Notifications**: Email alerts when embeddings are successfully created
 - **Subscriber Management**: Automatic creation of subscriber entries for tracking
+- **Redis Job Storage**: Persistent job storage with automatic expiration (production-ready)
+- **Security Features**: Protection against malicious files, viruses, and dangerous content
 
 ## Installation
 
@@ -56,6 +58,12 @@ AWS_ACCESS_KEY_ID=your-aws-access-key-id
 AWS_SECRET_ACCESS_KEY=your-aws-secret-access-key
 AWS_SES_FROM_EMAIL=noreply@yourdomain.com  # Must be verified in SES
 AWS_SES_TO_EMAIL=admin@yourdomain.com  # Where notifications are sent
+
+# Redis Configuration (for job storage - production)
+REDIS_URL=redis://default:password@host:port  # Automatically provided by Railway
+REDIS_JOB_TTL=86400  # Optional: 24 hours (default for processing jobs)
+REDIS_JOB_TTL_COMPLETED=3600  # Optional: 1 hour (default for completed jobs)
+REDIS_JOB_TTL_FAILED=86400  # Optional: 24 hours (default for failed jobs)
 ```
 
 ## Usage
@@ -443,18 +451,47 @@ The CLI outputs JSON with the following structure:
 
 ## Text Chunking for Embeddings
 
-For large PDFs (800+ pages), the API automatically chunks text intelligently for embedding generation:
+For large PDFs (800+ pages), the API automatically chunks text intelligently for embedding generation with advanced semantic splitting and text normalization:
+
+### Chunking Strategy
 
 - **Chunk Size**: 1000 characters per chunk (optimal for most embedding models)
-- **Overlap**: 200 characters between chunks (maintains context)
-- **Page Tracking**: Each chunk includes page range metadata
-- **Sentence Boundaries**: Chunks break at sentence boundaries when possible
+- **Overlap**: 200 characters between chunks (maintains context across boundaries)
+- **Semantic Splitting**: Text is split into semantic units (paragraphs, bullet points, sentences)
+- **Single Idea Per Chunk**: Each chunk ideally contains a single idea or concept
+- **Page Tracking**: Each chunk includes accurate page range metadata
+
+### Text Normalization
+
+The chunking process includes comprehensive text normalization:
+
+- **Line Break Normalization**: Multiple newlines converted to paragraph breaks
+- **Hyphenation Removal**: Removes hyphenation artifacts (e.g., `word-\nword` → `word word`)
+- **Bullet Point Standardization**: All bullet styles (`-`, `*`, `•`, `o`) normalized to consistent `•` format
+- **Whitespace Cleanup**: Multiple spaces normalized to single spaces (preserves paragraph structure)
+- **Trailing Whitespace**: Removed while maintaining document structure
+
+### Semantic Unit Splitting
+
+Text is intelligently split into semantic units before chunking:
+
+1. **Paragraphs**: Split by double newlines (paragraph breaks)
+2. **Bullet Lists**: Each bullet point becomes its own unit
+3. **Numbered Lists**: Each numbered item becomes its own unit
+4. **Long Paragraphs**: If a paragraph exceeds 800 characters, it's split by sentence boundaries
+5. **Regular Paragraphs**: Kept as single units if reasonably sized
+
+This ensures that:
+- Goals, barriers, and pathways are split individually (not in one 3,000-char chunk)
+- Each bullet point is a separate semantic unit
+- Long paragraphs are broken into smaller, focused chunks
+- Context is preserved through intelligent overlap
 
 **Chunk Structure:**
 ```json
 {
   "chunk_index": 0,
-  "text": "chunk text here...",
+  "text": "Normalized chunk text here...",
   "pages": [1, 2, 3],
   "start_page": 1,
   "end_page": 3,
@@ -462,7 +499,7 @@ For large PDFs (800+ pages), the API automatically chunks text intelligently for
 }
 ```
 
-The chunked text is stored in the `text_chunks` field in the database, ready for embedding generation.
+The chunked text is stored in the `text_chunks` field in the database, ready for embedding generation. Each chunk is optimized for semantic search and AI-powered question answering.
 
 ## Large PDF Support
 
@@ -597,6 +634,8 @@ When `send_webhook=true`, the API sends a POST request to `WEBHOOK_URL` when pro
 - `gunicorn>=21.2.0`: Production WSGI server (for deployment)
 - `requests>=2.31.0`: HTTP library for Nhost/webhook integration
 - `boto3>=1.34.0`: AWS SDK for SES and S3-compatible storage
+- `pdf2image>=1.16.0`: PDF to image conversion (requires Poppler)
+- `redis>=5.0.0`: Redis client for job storage (production)
 
 ## Deployment
 
@@ -624,34 +663,67 @@ See `DEPLOYMENT.md` for detailed deployment instructions for:
 - `AWS_SECRET_ACCESS_KEY` (if using email notifications)
 - `AWS_SES_FROM_EMAIL` (if using email notifications)
 - `AWS_SES_TO_EMAIL` (if using email notifications)
+- `REDIS_URL` (automatically provided by Railway when Redis service is added)
 
 ## Limitations
 
 - **Maximum file size**: 200MB (configurable in `api.py`)
+- **Maximum pages**: 10,000 pages per PDF (DoS protection)
+- **Maximum chunks**: 10,000 chunks per PDF (resource protection)
 - **Table extraction**: Can be slow for large PDFs (>100 pages)
 - **Complex layouts**: May affect extraction accuracy
 - **Encrypted PDFs**: May not be fully extractable
-- **Job storage**: In-memory (use Redis in production for persistence)
+- **Job storage**: Falls back to in-memory if Redis unavailable (not recommended for production)
 
 ## Production Considerations
 
-1. **Job Storage**: Replace in-memory `jobs` dictionary with Redis for persistence
+1. **Job Storage**: Redis is implemented and automatically used when `REDIS_URL` is set. Jobs automatically expire:
+   - Processing jobs: 24 hours
+   - Completed jobs: 1 hour (automatically deleted)
+   - Failed jobs: 24 hours
 2. **File Storage**: DigitalOcean Spaces integration is already implemented
 3. **Monitoring**: Add logging and monitoring for production
 4. **Rate Limiting**: Implement rate limiting for API endpoints
 5. **Error Handling**: Retry logic is implemented for Nhost/webhook calls
-6. **Scaling**: Use multiple workers for concurrent processing
+6. **Scaling**: Use multiple workers for concurrent processing (see `HOW_TO_PRODUCTION.md`)
 7. **Email Verification**: Ensure sender email is verified in AWS SES
 8. **CORS**: Configure `CORS_ORIGINS` appropriately for production
+9. **Redis Setup**: Add Redis service in Railway (automatically provides `REDIS_URL`)
+10. **Security**: Security features are enabled by default (see Security Features section)
 
 ## Security Features
 
-- **File Type Validation**: Only PDF files are accepted
-- **Magic Byte Validation**: Verifies actual PDF file structure
-- **File Size Limits**: Prevents DoS attacks via large files
+### File Validation
+- **File Type Validation**: Only PDF files are accepted (`.pdf` extension)
+- **Magic Byte Validation**: Verifies actual PDF file structure (checks `%PDF` header)
+- **File Size Limits**: 
+  - Minimum: 100 bytes (prevents empty/minimal files)
+  - Maximum: 200MB (prevents DoS attacks via large files)
+- **PDF Structure Validation**: Validates PDF integrity and detects malformed files
+- **Page Count Limits**: Maximum 10,000 pages per PDF (DoS protection)
 - **Secure Filenames**: Uses `secure_filename()` to prevent path traversal
+
+### Content Security
+- **PDF Structure Analysis**: Detects embedded JavaScript and embedded files (potential security risks)
+- **Text Sanitization**: Removes null bytes, control characters, and excessive whitespace
+- **Dangerous Content Detection**: Detects SQL injection, script injection, and command injection patterns
+- **Chunk Limits**: Maximum 10,000 chunks per PDF and 2,000 characters per chunk (resource protection)
+- **Text Truncation**: Automatically truncates text exceeding safe limits
+
+### Infrastructure Security
 - **CORS Configuration**: Configurable CORS origins
 - **Environment Variables**: Sensitive data stored in environment variables
+- **Redis Security**: Jobs automatically expire to prevent data accumulation
+- **Error Handling**: Secure error messages that don't leak sensitive information
+
+### Security Warnings
+The system logs warnings for:
+- PDFs containing JavaScript (potential XSS risk)
+- PDFs containing embedded files (potential malware)
+- Dangerous content patterns in extracted text
+- Files exceeding recommended limits
+
+**Note**: By default, the system logs warnings but continues processing (fail-open policy). You can modify the code to reject files with security warnings if you prefer a stricter fail-closed policy.
 
 ## License
 

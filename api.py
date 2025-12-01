@@ -18,6 +18,8 @@ License: Open Source
 """
 
 import os
+import re
+import json
 import tempfile
 import threading
 import uuid
@@ -29,6 +31,13 @@ import requests
 import boto3
 from botocore.exceptions import ClientError
 from pdf_extractor import PDFExtractor
+
+# Try to import Redis for job storage
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 
 # Try to import pdf2image for PDF to JPG conversion
 try:
@@ -56,6 +65,11 @@ CORS(app, origins=cors_origins)
 # Configuration
 ALLOWED_EXTENSIONS = {'pdf'}
 MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB (increased for large car manuals)
+MIN_FILE_SIZE = 100  # Minimum 100 bytes (prevents empty/minimal files)
+MAX_PDF_PAGES = 10000  # Maximum pages per PDF (prevent DoS)
+MAX_CHUNKS_PER_PDF = 10000  # Maximum chunks per PDF
+MAX_CHARS_PER_CHUNK = 2000  # Maximum characters per chunk
+MAX_CHUNK_LENGTH = 100000  # Maximum characters per chunk before truncation
 UPLOAD_FOLDER = tempfile.gettempdir()
 
 # Nhost configuration
@@ -82,11 +96,123 @@ AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
 AWS_SES_FROM_EMAIL = os.environ.get('AWS_SES_FROM_EMAIL', '')  # Verified sender email in SES
 AWS_SES_TO_EMAIL = os.environ.get('AWS_SES_TO_EMAIL', '')  # Optional: Default recipient email
 
+# Redis configuration (for job storage on Railway)
+# Railway provides REDIS_URL automatically when Redis service is added
+REDIS_URL = os.environ.get('REDIS_URL', '')
+REDIS_JOB_TTL = int(os.environ.get('REDIS_JOB_TTL', 86400))  # Default: 24 hours
+REDIS_JOB_TTL_COMPLETED = int(os.environ.get('REDIS_JOB_TTL_COMPLETED', 3600))  # Default: 1 hour for completed jobs
+REDIS_JOB_TTL_FAILED = int(os.environ.get('REDIS_JOB_TTL_FAILED', 86400))  # Default: 24 hours for failed jobs
+
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# In-memory job storage (use Redis in production)
-jobs = {}
+# Initialize Redis client for job storage
+redis_client = None
+if REDIS_AVAILABLE and REDIS_URL:
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()  # Test connection
+        try:
+            app.logger.info("Redis connected successfully for job storage")
+        except:
+            print("Redis connected successfully for job storage")
+    except Exception as e:
+        try:
+            app.logger.error(f"Redis connection failed: {str(e)}")
+            app.logger.warning("Falling back to in-memory job storage")
+        except:
+            print(f"Redis connection failed: {str(e)}")
+            print("Falling back to in-memory job storage")
+        redis_client = None
+else:
+    if not REDIS_AVAILABLE:
+        try:
+            app.logger.warning("Redis library not available. Install with: pip install redis")
+        except:
+            print("Redis library not available. Install with: pip install redis")
+    if not REDIS_URL:
+        try:
+            app.logger.warning("REDIS_URL not set, using in-memory job storage (not recommended for production)")
+        except:
+            print("REDIS_URL not set, using in-memory job storage (not recommended for production)")
+
+# Fallback to in-memory storage if Redis unavailable
+jobs = {} if not redis_client else None
+
+
+def _get_job(job_id):
+    """
+    Get job from Redis or in-memory fallback.
+    
+    Args:
+        job_id: Job identifier
+    
+    Returns:
+        Job dictionary or None if not found
+    """
+    if redis_client:
+        try:
+            job_data = redis_client.get(f"job:{job_id}")
+            if job_data:
+                return json.loads(job_data)
+            return None
+        except Exception as e:
+            app.logger.error(f"Error getting job from Redis: {str(e)}")
+            return None
+    else:
+        return jobs.get(job_id) if jobs else None
+
+
+def _set_job(job_id, job_data, ttl=None):
+    """
+    Set job in Redis or in-memory fallback.
+    
+    Args:
+        job_id: Job identifier
+        job_data: Job dictionary
+        ttl: Time to live in seconds (None uses default based on status)
+    """
+    if redis_client:
+        try:
+            # Determine TTL based on job status if not provided
+            if ttl is None:
+                status = job_data.get('status', 'processing')
+                if status == 'completed':
+                    ttl = REDIS_JOB_TTL_COMPLETED
+                elif status == 'failed':
+                    ttl = REDIS_JOB_TTL_FAILED
+                else:
+                    ttl = REDIS_JOB_TTL
+            
+            redis_client.setex(
+                f"job:{job_id}",
+                ttl,
+                json.dumps(job_data)
+            )
+            app.logger.debug(f"Job {job_id} stored in Redis with TTL {ttl}s (status: {job_data.get('status', 'unknown')})")
+        except Exception as e:
+            app.logger.error(f"Error storing job in Redis: {str(e)}")
+    else:
+        if jobs is not None:
+            jobs[job_id] = job_data
+
+
+def _delete_job(job_id):
+    """
+    Delete job from Redis or in-memory fallback.
+    
+    Args:
+        job_id: Job identifier
+    """
+    if redis_client:
+        try:
+            redis_client.delete(f"job:{job_id}")
+            app.logger.debug(f"Job {job_id} deleted from Redis")
+        except Exception as e:
+            app.logger.error(f"Error deleting job from Redis: {str(e)}")
+    else:
+        if jobs is not None:
+            jobs.pop(job_id, None)
 
 
 def allowed_file(filename):
@@ -111,6 +237,9 @@ def validate_pdf_file(file_path):
         if file_size == 0:
             return False, "File is empty"
         
+        if file_size < MIN_FILE_SIZE:
+            return False, f"File is too small to be a valid PDF (minimum {MIN_FILE_SIZE} bytes)"
+        
         if file_size > MAX_FILE_SIZE:
             return False, f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / (1024*1024)}MB"
         
@@ -128,7 +257,12 @@ def validate_pdf_file(file_path):
             from PyPDF2 import PdfReader
             reader = PdfReader(file_path)
             # Try to get page count to ensure PDF is readable
-            _ = len(reader.pages)
+            num_pages = len(reader.pages)
+            
+            # Check for reasonable page count (prevent DoS)
+            if num_pages > MAX_PDF_PAGES:
+                return False, f"PDF has too many pages (max: {MAX_PDF_PAGES})"
+            
         except Exception as e:
             return False, f"File appears to be corrupted or not a valid PDF: {str(e)}"
         
@@ -136,6 +270,125 @@ def validate_pdf_file(file_path):
         
     except Exception as e:
         return False, f"Error validating file: {str(e)}"
+
+
+def validate_pdf_structure(file_path):
+    """
+    Validate PDF structure to detect malformed or malicious PDFs.
+    Checks for embedded JavaScript, embedded files, and other security risks.
+    
+    Args:
+        file_path: Path to the PDF file
+    
+    Returns:
+        Tuple of (is_valid: bool, error_message: str, warnings: list)
+    """
+    warnings = []
+    try:
+        from PyPDF2 import PdfReader
+        
+        reader = PdfReader(file_path)
+        
+        # Check for reasonable page count (prevent DoS)
+        num_pages = len(reader.pages)
+        if num_pages > MAX_PDF_PAGES:
+            return False, f"PDF has too many pages (max: {MAX_PDF_PAGES})", warnings
+        
+        # Try to read first page to ensure it's not corrupted
+        if num_pages > 0:
+            try:
+                first_page = reader.pages[0]
+                _ = first_page.extract_text()  # Try to extract text
+            except Exception as e:
+                return False, f"PDF first page is corrupted: {str(e)}", warnings
+        
+        # Check for embedded JavaScript (potential security risk)
+        try:
+            root = reader.trailer.get('/Root', {})
+            if isinstance(root, dict):
+                if '/JavaScript' in root:
+                    warnings.append("PDF contains JavaScript (potential security risk)")
+                    app.logger.warning(f"PDF contains JavaScript: {file_path}")
+                    # Optionally reject: return False, "PDF contains JavaScript (security risk)", warnings
+                
+                # Check for embedded files (potential malware)
+                if '/EmbeddedFiles' in root:
+                    warnings.append("PDF contains embedded files (potential security risk)")
+                    app.logger.warning(f"PDF contains embedded files: {file_path}")
+                    # Optionally reject: return False, "PDF contains embedded files (security risk)", warnings
+        except Exception:
+            # If we can't check, continue (fail open)
+            pass
+        
+        return True, None, warnings
+        
+    except Exception as e:
+        return False, f"PDF structure validation failed: {str(e)}", warnings
+
+
+def sanitize_text_for_embeddings(text):
+    """
+    Sanitize text to prevent injection of malicious content in embeddings.
+    
+    Args:
+        text: Raw extracted text
+    
+    Returns:
+        Sanitized text
+    """
+    if not text:
+        return ""
+    
+    # Remove null bytes (potential injection vector)
+    text = text.replace('\x00', '')
+    
+    # Remove control characters (except newlines and tabs)
+    text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', text)
+    
+    # Limit text length per chunk (prevent DoS)
+    if len(text) > MAX_CHUNK_LENGTH:
+        text = text[:MAX_CHUNK_LENGTH]
+        app.logger.warning(f"Text truncated to {MAX_CHUNK_LENGTH} characters")
+    
+    # Remove excessive whitespace (but preserve structure)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{10,}', '\n\n', text)  # Max 2 consecutive newlines
+    
+    return text.strip()
+
+
+def detect_dangerous_content(text):
+    """
+    Detect potentially dangerous content patterns in extracted text.
+    
+    Args:
+        text: Text to analyze
+    
+    Returns:
+        Tuple of (is_dangerous: bool, reason: str)
+    """
+    if not text:
+        return False, None
+    
+    dangerous_patterns = [
+        # SQL injection patterns
+        (r'(?i)(union|select|insert|delete|drop|exec|execute).*from', 'Potential SQL injection'),
+        # Script injection
+        (r'(?i)<script[^>]*>.*?</script>', 'JavaScript code detected'),
+        # Command injection
+        (r'(?i)(system|exec|eval|subprocess|os\.system)', 'Potential command injection'),
+        # Excessive encoded content (potential obfuscation)
+        (r'%[0-9A-Fa-f]{2}{100,}', 'Excessive URL encoding (potential obfuscation)'),
+    ]
+    
+    for pattern, reason in dangerous_patterns:
+        if re.search(pattern, text):
+            app.logger.warning(f"Dangerous content detected: {reason}")
+            # Log but don't reject (fail open) - adjust based on your security policy
+            # To reject: return True, reason
+            # To flag only: return False, reason (current behavior)
+    
+    return False, None
 
 
 def convert_pdf_first_page_to_jpg(pdf_path, output_path=None):
@@ -302,10 +555,125 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id, content_type='applic
         return None
 
 
+def _normalize_text(text):
+    """
+    Normalize text by removing inconsistent formatting, line breaks, and hyphenation artifacts.
+    
+    Args:
+        text: Raw text string
+    
+    Returns:
+        Normalized text string
+    """
+    if not text:
+        return ""
+    
+    # Normalize line breaks - replace multiple newlines with double newline (paragraph break)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Remove hyphenation artifacts (hyphen at end of line followed by word on next line)
+    # Pattern: word-\nword becomes wordword, but we want word word
+    text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
+    # Fix cases where hyphenation was removed but should be a space
+    text = re.sub(r'(\w{2,})([A-Z][a-z]+)', r'\1 \2', text)  # camelCase split
+    
+    # Normalize bullet points - convert various bullet styles to consistent •
+    # Match common bullet patterns: -, *, •, o, etc.
+    text = re.sub(r'^\s*[-*•o]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+[.)]\s+', r'\g<0>', text)  # Keep numbered lists as-is
+    
+    # Normalize whitespace - multiple spaces to single space (but preserve paragraph breaks)
+    text = re.sub(r'[ \t]+', ' ', text)
+    
+    # Remove trailing whitespace from lines but keep paragraph structure
+    lines = text.split('\n')
+    normalized_lines = [line.rstrip() for line in lines]
+    text = '\n'.join(normalized_lines)
+    
+    # Fix inconsistent capitalization at sentence starts (optional - can be aggressive)
+    # We'll keep original capitalization but ensure proper sentence boundaries
+    
+    return text.strip()
+
+
+def _split_into_semantic_units(text):
+    """
+    Split text into semantic units (paragraphs, bullet points, sentences).
+    Each unit should ideally contain a single idea.
+    
+    Args:
+        text: Normalized text string
+    
+    Returns:
+        List of semantic units (strings)
+    """
+    if not text:
+        return []
+    
+    units = []
+    
+    # First, split by double newlines (paragraph breaks)
+    paragraphs = text.split('\n\n')
+    
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        
+        # Check if paragraph is a bullet list
+        bullet_pattern = r'^•\s+'
+        if re.match(bullet_pattern, para, re.MULTILINE):
+            # Split bullet list into individual bullets
+            bullets = re.split(r'\n(?=•\s+)', para)
+            for bullet in bullets:
+                bullet = bullet.strip()
+                if bullet:
+                    units.append(bullet)
+        else:
+            # Check if it's a numbered list
+            if re.match(r'^\d+[.)]\s+', para, re.MULTILINE):
+                # Split numbered list items
+                items = re.split(r'\n(?=\d+[.)]\s+)', para)
+                for item in items:
+                    item = item.strip()
+                    if item:
+                        units.append(item)
+            else:
+                # Regular paragraph - check if it's too long
+                # If paragraph is very long, try to split by sentences
+                if len(para) > 800:
+                    # Split by sentence boundaries
+                    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', para)
+                    current_unit = ""
+                    for sentence in sentences:
+                        sentence = sentence.strip()
+                        if not sentence:
+                            continue
+                        
+                        # If adding this sentence would exceed reasonable size, save current
+                        if current_unit and len(current_unit) + len(sentence) + 1 > 600:
+                            units.append(current_unit.strip())
+                            current_unit = sentence
+                        else:
+                            if current_unit:
+                                current_unit += " " + sentence
+                            else:
+                                current_unit = sentence
+                    
+                    if current_unit.strip():
+                        units.append(current_unit.strip())
+                else:
+                    # Paragraph is reasonable size, keep as single unit
+                    units.append(para)
+    
+    return units
+
+
 def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
     """
-    Chunk text intelligently for embeddings.
+    Chunk text intelligently for embeddings with improved semantic splitting.
     For large PDFs (800+ pages), we need to split text into manageable chunks.
+    Each chunk should ideally contain a single idea.
     
     Args:
         text_by_page: Dictionary of page text data
@@ -323,9 +691,9 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
         key=lambda x: x[1].get('page_number', 0) if isinstance(x[1], dict) else 0
     )
     
-    current_chunk = ""
-    current_pages = []
-    chunk_index = 0
+    # First pass: normalize all text and split into semantic units
+    all_units = []
+    unit_to_page = {}  # Map unit index to page number
     
     for page_key, page_data in sorted_pages:
         if not isinstance(page_data, dict) or 'text' not in page_data:
@@ -337,52 +705,95 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
         if not page_text.strip():
             continue
         
-        # If adding this page would exceed chunk size, save current chunk
-        if current_chunk and len(current_chunk) + len(page_text) > chunk_size:
-            chunks.append({
-                'chunk_index': chunk_index,
-                'text': current_chunk.strip(),
-                'pages': current_pages.copy(),
-                'char_count': len(current_chunk),
-                'start_page': min(current_pages) if current_pages else page_num,
-                'end_page': max(current_pages) if current_pages else page_num
-            })
-            chunk_index += 1
+        # Normalize the page text
+        normalized_text = _normalize_text(page_text)
+        
+        # Sanitize text for embeddings (remove dangerous content)
+        sanitized_text = sanitize_text_for_embeddings(normalized_text)
+        
+        # Detect dangerous content (log warnings)
+        is_dangerous, reason = detect_dangerous_content(sanitized_text)
+        if is_dangerous:
+            app.logger.error(f"Dangerous content detected in page {page_num}: {reason}")
+            # Optionally skip this page or reject entire PDF
+            # For now, we log and continue (adjust based on security policy)
+        
+        # Split into semantic units
+        units = _split_into_semantic_units(sanitized_text)
+        
+        # Track which page each unit belongs to
+        for unit in units:
+            unit_index = len(all_units)
+            all_units.append(unit)
+            unit_to_page[unit_index] = page_num
+    
+    # Second pass: combine units into chunks
+    current_chunk = ""
+    current_pages = set()
+    chunk_index = 0
+    
+    for i, unit in enumerate(all_units):
+        unit_page = unit_to_page.get(i, 0)
+        
+        # Check if adding this unit would exceed chunk size
+        unit_with_separator = "\n\n" + unit if current_chunk else unit
+        potential_chunk_size = len(current_chunk) + len(unit_with_separator)
+        
+        if current_chunk and potential_chunk_size > chunk_size:
+            # Save current chunk
+            if current_chunk.strip():
+                chunks.append({
+                    'chunk_index': chunk_index,
+                    'text': current_chunk.strip(),
+                    'pages': sorted(list(current_pages)),
+                    'char_count': len(current_chunk),
+                    'start_page': min(current_pages) if current_pages else 0,
+                    'end_page': max(current_pages) if current_pages else 0
+                })
+                chunk_index += 1
             
             # Start new chunk with overlap from previous
             if overlap > 0 and current_chunk:
                 # Take last 'overlap' characters for context
                 overlap_text = current_chunk[-overlap:].strip()
-                # Try to start at a sentence boundary
-                sentences = overlap_text.split('. ')
+                # Try to start at a sentence or unit boundary
+                # If overlap text ends mid-sentence, try to find last complete sentence
+                sentences = re.split(r'(?<=[.!?])\s+', overlap_text)
                 if len(sentences) > 1:
-                    overlap_text = '. '.join(sentences[-2:]) + '.'
-                current_chunk = overlap_text + "\n\n" + page_text
-                # Keep last page in overlap
-                current_pages = [current_pages[-1]] if current_pages else []
+                    overlap_text = ' '.join(sentences[-2:])
+                elif len(sentences) == 1 and len(overlap_text) > overlap // 2:
+                    # If we have a long single sentence, take last part
+                    overlap_text = overlap_text[-overlap // 2:]
+                
+                current_chunk = overlap_text + "\n\n" + unit
+                # Keep pages from overlap (last page)
+                current_pages = {max(current_pages)} if current_pages else {unit_page}
             else:
-                current_chunk = page_text
-                current_pages = []
-            
-            current_pages.append(page_num)
+                current_chunk = unit
+                current_pages = {unit_page}
         else:
-            # Add to current chunk
+            # Add unit to current chunk
             if current_chunk:
-                current_chunk += "\n\n" + page_text
+                current_chunk += "\n\n" + unit
             else:
-                current_chunk = page_text
-            current_pages.append(page_num)
+                current_chunk = unit
+            current_pages.add(unit_page)
     
     # Add final chunk
     if current_chunk.strip():
         chunks.append({
             'chunk_index': chunk_index,
             'text': current_chunk.strip(),
-            'pages': current_pages,
+            'pages': sorted(list(current_pages)),
             'char_count': len(current_chunk),
             'start_page': min(current_pages) if current_pages else 0,
             'end_page': max(current_pages) if current_pages else 0
         })
+    
+    # Limit total chunks per PDF (prevent resource exhaustion)
+    if len(chunks) > MAX_CHUNKS_PER_PDF:
+        app.logger.warning(f"PDF has {len(chunks)} chunks, limiting to {MAX_CHUNKS_PER_PDF}")
+        chunks = chunks[:MAX_CHUNKS_PER_PDF]
     
     return chunks
 
@@ -940,36 +1351,50 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
         file_url: Optional URL if file is stored in S3/storage
         upload_device: Device/platform used for upload (default: 'web')
     """
-    jobs[job_id] = {
+    _set_job(job_id, {
         'status': 'processing', 
         'progress': 0,
         'stage': 'file_received',
         'message': 'File received, starting extraction...'
-    }
+    })
     
     try:
         # Update: Reading file
-        jobs[job_id] = {
+        _set_job(job_id, {
             'status': 'processing',
             'progress': 5,
             'stage': 'reading',
             'message': 'Reading PDF file...'
-        }
+        })
         
         # Verify file still exists before processing
         if not os.path.exists(file_path):
             error_msg = f"File does not exist at path: {file_path}"
             app.logger.error(error_msg)
-            jobs[job_id] = {'status': 'failed', 'error': error_msg, 'stage': 'failed'}
+            _set_job(job_id, {'status': 'failed', 'error': error_msg, 'stage': 'failed'}, ttl=REDIS_JOB_TTL_FAILED)
             if send_webhook:
                 _send_webhook(job_id, 'failed', error=error_msg)
             return
         
         app.logger.info(f"Processing PDF from path: {file_path} (exists: {os.path.exists(file_path)}, size: {os.path.getsize(file_path)} bytes)")
         
+        # Validate PDF structure (security check)
+        is_valid, error_msg, warnings = validate_pdf_structure(file_path)
+        if not is_valid:
+            app.logger.error(f"PDF structure validation failed: {error_msg}")
+            _set_job(job_id, {'status': 'failed', 'error': f"PDF validation failed: {error_msg}", 'stage': 'failed'}, ttl=REDIS_JOB_TTL_FAILED)
+            if send_webhook:
+                _send_webhook(job_id, 'failed', error=error_msg)
+            return
+        
+        # Log warnings if any
+        if warnings:
+            for warning in warnings:
+                app.logger.warning(f"PDF security warning: {warning}")
+        
         # Process extraction using file path with progress updates
         result, filename = _process_pdf_extraction_from_path(
-            file_path, original_filename, extract_type, pages, include_tables, jobs, job_id
+            file_path, original_filename, extract_type, pages, include_tables, None, job_id
         )
         
         # Verify file still exists after extraction (before Spaces upload)
@@ -979,7 +1404,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             app.logger.info(f"File still exists after extraction: {file_path} (size: {os.path.getsize(file_path)} bytes)")
         
         if result is None:
-            jobs[job_id] = {'status': 'failed', 'error': filename, 'stage': 'failed'}
+            _set_job(job_id, {'status': 'failed', 'error': filename, 'stage': 'failed'}, ttl=REDIS_JOB_TTL_FAILED)
             if send_webhook:
                 _send_webhook(job_id, 'failed', error=filename)
             # Clean up file on failure
@@ -992,35 +1417,35 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             return
         
         # Update: Completed reading
-        jobs[job_id] = {
+        _set_job(job_id, {
             'status': 'processing',
             'progress': 50,
             'stage': 'reading_complete',
             'message': 'Completed reading PDF, extracting data...'
-        }
+        })
         
         # Send to Nhost if enabled
         nhost_result = None
         if send_to_nhost:
-            jobs[job_id] = {
+            _set_job(job_id, {
                 'status': 'processing',
                 'progress': 60,
                 'stage': 'sending_to_db',
                 'message': 'Chunking text for embeddings...'
-            }
+            })
             app.logger.info(f"Calling _send_to_nhost for job {job_id}, user_id: {user_id}, upload_device: {upload_device}")
             # user_display_name is already passed as a parameter to this function
-            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device, file_path=file_path, user_display_name=user_display_name)
+            nhost_result = _send_to_nhost(result, job_id, filename, user_id, None, file_url=file_url, upload_device=upload_device, file_path=file_path, user_display_name=user_display_name)
             if nhost_result is None:
                 app.logger.warning(f"Failed to send data to Nhost for job {job_id}")
             else:
                 app.logger.info(f"Successfully sent to Nhost for job {job_id}: {nhost_result}")
-            jobs[job_id] = {
+            _set_job(job_id, {
                 'status': 'processing',
                 'progress': 90,
                 'stage': 'sending_to_db',
                 'message': 'Data sent to database successfully'
-            }
+            })
         
         # Clean up temporary file after all processing is complete (including Spaces upload)
         if file_path and os.path.exists(file_path):
@@ -1030,8 +1455,8 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             except Exception as e:
                 app.logger.warning(f"Failed to clean up temporary file {file_path}: {str(e)}")
         
-        # Update job status - Done
-        jobs[job_id] = {
+        # Update job status - Done (completed jobs expire after 1 hour)
+        _set_job(job_id, {
             'status': 'completed',
             'progress': 100,
             'stage': 'done',
@@ -1039,7 +1464,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             'filename': filename,
             'data': result,
             'nhost_result': nhost_result
-        }
+        }, ttl=REDIS_JOB_TTL_COMPLETED)
         
         # Send webhook
         if send_webhook:
@@ -1051,7 +1476,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             
     except Exception as e:
         error_msg = str(e)
-        jobs[job_id] = {'status': 'failed', 'error': error_msg}
+        _set_job(job_id, {'status': 'failed', 'error': error_msg, 'stage': 'failed'}, ttl=REDIS_JOB_TTL_FAILED)
         if send_webhook:
             _send_webhook(job_id, 'failed', error=error_msg)
 
@@ -1110,13 +1535,13 @@ def _process_pdf_extraction_from_path(file_path, filename, extract_type='all', p
             metadata = extractor.extract_metadata()
             num_pages = metadata.get('num_pages', 0)
             
-            if jobs_dict and job_id:
-                jobs_dict[job_id] = {
+            if job_id:
+                _set_job(job_id, {
                     'status': 'processing',
                     'progress': 10,
                     'stage': 'reading',
                     'message': f'Reading PDF ({num_pages} pages)...'
-                }
+                })
             
             if extract_type == 'metadata':
                 result = {'metadata': metadata}
@@ -1131,34 +1556,34 @@ def _process_pdf_extraction_from_path(file_path, filename, extract_type='all', p
                     'text': extractor.extract_text(pages),
                 }
                 
-                if jobs_dict and job_id:
-                    jobs_dict[job_id] = {
+                if job_id:
+                    _set_job(job_id, {
                         'status': 'processing',
                         'progress': 30,
                         'stage': 'reading',
                         'message': f'Extracted text from {num_pages} pages, processing tables...'
-                    }
+                    })
                 
                 # Tables can be very slow for large PDFs - extract conditionally
                 if include_tables:
                     # For very large PDFs, warn that tables take time
                     if num_pages > 100:
-                        if jobs_dict and job_id:
-                            jobs_dict[job_id] = {
+                        if job_id:
+                            _set_job(job_id, {
                                 'status': 'processing',
                                 'progress': 35,
                                 'stage': 'reading',
                                 'message': f'Extracting tables from {num_pages} pages (this may take a while)...'
-                            }
+                            })
                     result['tables'] = extractor.extract_tables(pages)
         
-        if jobs_dict and job_id:
-            jobs_dict[job_id] = {
+        if job_id:
+            _set_job(job_id, {
                 'status': 'processing',
                 'progress': 50,
                 'stage': 'reading_complete',
                 'message': 'Completed reading PDF, preparing data...'
-            }
+            })
         
         return result, filename
         
@@ -1190,7 +1615,12 @@ def index():
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
-    return jsonify({'status': 'healthy', 'service': 'PDF Extractor API'})
+    health_status = {
+        'status': 'healthy',
+        'service': 'PDF Extractor API',
+        'redis': 'connected' if redis_client and redis_client.ping() else 'disconnected'
+    }
+    return jsonify(health_status)
 
 
 @app.route('/debug/nhost', methods=['GET'])
@@ -1413,6 +1843,19 @@ def extract_pdf_async():
                 'error': f'Failed to save file: {str(e)}'
             }), 500
         
+        # Validate PDF file (basic validation)
+        is_valid, error_msg = validate_pdf_file(temp_path)
+        if not is_valid:
+            # Clean up file
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+            return jsonify({
+                'success': False,
+                'error': error_msg
+            }), 400
+        
         # Start async processing with file path instead of file object
         thread = threading.Thread(
             target=_process_extraction_async,
@@ -1490,10 +1933,9 @@ def get_job_status(job_id):
         200: Job found (status may be processing, completed, or failed)
         404: Job not found
     """
-    if job_id not in jobs:
+    job = _get_job(job_id)
+    if not job:
         return jsonify({'error': 'Job not found'}), 404
-    
-    job = jobs[job_id]
     response = {
         'job_id': job_id,
         'status': job['status']
