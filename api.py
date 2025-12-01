@@ -635,7 +635,7 @@ def _create_subscriber_entry(pdf_embedding_id, user_id, graphql_url, headers):
                 mutation InsertPDFEmbeddingSubscriber($object: pdf_embeddings_subscribers_insert_input!) {
                     insert_pdf_embeddings_subscribers_one(object: $object) {
                         id
-                        user_ID
+                        user_id
                         pdf_embedding_id
                         useCount
                         created_at
