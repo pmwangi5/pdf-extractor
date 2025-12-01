@@ -625,7 +625,7 @@ def _create_subscriber_entry(pdf_embedding_id, user_id, graphql_url, headers):
     """
     try:
         mutation_object = {
-            "user_ID": user_id,  # Note: using user_ID as per table structure
+            "user_id": user_id,  # Note: using user_ID as per table structure
             "pdf_embedding_id": pdf_embedding_id,
             "useCount": 0
         }
