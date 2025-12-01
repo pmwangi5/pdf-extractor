@@ -360,6 +360,7 @@ def sanitize_text_for_embeddings(text):
 def detect_dangerous_content(text):
     """
     Detect potentially dangerous content patterns in extracted text.
+    Uses specific patterns to avoid false positives from normal text.
     
     Args:
         text: Text to analyze
@@ -371,22 +372,28 @@ def detect_dangerous_content(text):
         return False, None
     
     dangerous_patterns = [
-        # SQL injection patterns
-        (r'(?i)(union|select|insert|delete|drop|exec|execute).*from', 'Potential SQL injection'),
-        # Script injection
+        # SQL injection patterns - only flag if followed by FROM/WHERE/etc (actual SQL)
+        (r'(?i)(union|select|insert|delete|drop)\s+.*?\s+(from|where|into|table)', 'Potential SQL injection'),
+        # Script injection - actual HTML script tags
         (r'(?i)<script[^>]*>.*?</script>', 'JavaScript code detected'),
-        # Command injection
-        (r'(?i)(system|exec|eval|subprocess|os\.system)', 'Potential command injection'),
-        # Excessive encoded content (potential obfuscation)
-        (r'%[0-9A-Fa-f]{2}{100,}', 'Excessive URL encoding (potential obfuscation)'),
+        # Command injection - only flag actual code patterns, not common words
+        # Look for patterns like: os.system(, subprocess.call(, eval(, exec(
+        (r'(?i)(os\.system|subprocess\.(call|run|Popen)|eval\s*\(|exec\s*\(|__import__)', 'Potential command injection'),
+        # Excessive encoded content (potential obfuscation) - fixed regex syntax
+        (r'(?:%[0-9A-Fa-f]{2}){100,}', 'Excessive URL encoding (potential obfuscation)'),
     ]
     
     for pattern, reason in dangerous_patterns:
-        if re.search(pattern, text):
-            app.logger.warning(f"Dangerous content detected: {reason}")
-            # Log but don't reject (fail open) - adjust based on your security policy
-            # To reject: return True, reason
-            # To flag only: return False, reason (current behavior)
+        try:
+            if re.search(pattern, text):
+                app.logger.warning(f"Dangerous content detected: {reason}")
+                # Log but don't reject (fail open) - adjust based on your security policy
+                # To reject: return True, reason
+                # To flag only: return False, reason (current behavior)
+        except re.error as e:
+            # If regex pattern is invalid, log error but don't break processing
+            app.logger.error(f"Invalid regex pattern in dangerous content detection: {pattern}, error: {str(e)}")
+            continue
     
     return False, None
 
@@ -711,12 +718,15 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
         # Sanitize text for embeddings (remove dangerous content)
         sanitized_text = sanitize_text_for_embeddings(normalized_text)
         
-        # Detect dangerous content (log warnings)
-        is_dangerous, reason = detect_dangerous_content(sanitized_text)
-        if is_dangerous:
-            app.logger.error(f"Dangerous content detected in page {page_num}: {reason}")
-            # Optionally skip this page or reject entire PDF
-            # For now, we log and continue (adjust based on security policy)
+        # Detect dangerous content (log warnings only, don't block processing)
+        # Uses specific patterns to avoid false positives from normal text
+        try:
+            is_dangerous, reason = detect_dangerous_content(sanitized_text)
+            if is_dangerous:
+                app.logger.warning(f"Dangerous content detected in page {page_num}: {reason}")
+        except Exception as e:
+            # If detection fails, log but don't break processing
+            app.logger.warning(f"Error in dangerous content detection for page {page_num}: {str(e)}")
         
         # Split into semantic units
         units = _split_into_semantic_units(sanitized_text)
