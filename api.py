@@ -776,8 +776,9 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
                     overlap_text = overlap_text[-overlap // 2:]
                 
                 current_chunk = overlap_text + "\n\n" + unit
-                # Keep pages from overlap (last page)
+                # Keep pages from overlap (last page) and add current unit's page
                 current_pages = {max(current_pages)} if current_pages else {unit_page}
+                current_pages.add(unit_page)
             else:
                 current_chunk = unit
                 current_pages = {unit_page}
