@@ -61,7 +61,7 @@ class PDFExtractor:
     
     def extract_text(self, pages: Optional[List[int]] = None) -> Dict[str, Any]:
         """
-        Extract text from PDF pages.
+        Extract text from PDF pages with improved layout preservation.
         
         Args:
             pages: List of page numbers to extract (0-indexed). If None, extracts all pages.
@@ -75,13 +75,28 @@ class PDFExtractor:
         if pages is None:
             pages = range(len(self.pdfplumber_pdf.pages))
         
+        # Enhanced extraction settings for better text quality
+        extraction_settings = {
+            'layout': True,  # Preserve layout
+            'x_tolerance': 3,  # Horizontal tolerance for character grouping
+            'y_tolerance': 3,  # Vertical tolerance for line grouping
+            'keep_blank_chars': False,  # Remove blank characters
+            'use_text_flow': True,  # Follow text flow direction
+        }
+        
         for page_num in pages:
             if 0 <= page_num < len(self.pdfplumber_pdf.pages):
                 page = self.pdfplumber_pdf.pages[page_num]
-                text = page.extract_text()
+                # Use enhanced extraction settings
+                text = page.extract_text(**extraction_settings)
+                
+                # Fallback to basic extraction if enhanced fails
+                if not text:
+                    text = page.extract_text()
+                
                 text_data[f'page_{page_num + 1}'] = {
                     'page_number': page_num + 1,
-                    'text': text,
+                    'text': text if text else '',
                     'char_count': len(text) if text else 0
                 }
         

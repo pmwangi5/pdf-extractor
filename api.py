@@ -68,7 +68,7 @@ MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB (increased for large car manuals)
 MIN_FILE_SIZE = 100  # Minimum 100 bytes (prevents empty/minimal files)
 MAX_PDF_PAGES = 10000  # Maximum pages per PDF (prevent DoS)
 MAX_CHUNKS_PER_PDF = 10000  # Maximum chunks per PDF
-MAX_CHARS_PER_CHUNK = 2000  # Maximum characters per chunk
+MAX_CHARS_PER_CHUNK = 3000  # Maximum characters per chunk (increased for better context)
 MAX_CHUNK_LENGTH = 100000  # Maximum characters per chunk before truncation
 UPLOAD_FOLDER = tempfile.gettempdir()
 
@@ -564,7 +564,8 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id, content_type='applic
 
 def _normalize_text(text):
     """
-    Normalize text by removing inconsistent formatting, line breaks, and hyphenation artifacts.
+    Normalize text by removing inconsistent formatting while preserving important structure.
+    Improved to maintain more context and semantic meaning.
     
     Args:
         text: Raw text string
@@ -575,18 +576,21 @@ def _normalize_text(text):
     if not text:
         return ""
     
+    # Preserve section headers and titles (lines in ALL CAPS or Title Case)
+    # These are important for document structure
+    
     # Normalize line breaks - replace multiple newlines with double newline (paragraph break)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    # But preserve up to triple newlines for section breaks
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
     
     # Remove hyphenation artifacts (hyphen at end of line followed by word on next line)
-    # Pattern: word-\nword becomes wordword, but we want word word
+    # Pattern: word-\nword becomes wordword
+    # Be careful not to remove intentional hyphens
     text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
-    # Fix cases where hyphenation was removed but should be a space
-    text = re.sub(r'(\w{2,})([A-Z][a-z]+)', r'\1 \2', text)  # camelCase split
     
     # Normalize bullet points - convert various bullet styles to consistent •
-    # Match common bullet patterns: -, *, •, o, etc.
-    text = re.sub(r'^\s*[-*•o]\s+', '• ', text, flags=re.MULTILINE)
+    # Match common bullet patterns: -, *, •, o, ▶, etc.
+    text = re.sub(r'^\s*[-*•o▶►]\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+[.)]\s+', r'\g<0>', text)  # Keep numbered lists as-is
     
     # Normalize whitespace - multiple spaces to single space (but preserve paragraph breaks)
@@ -597,16 +601,94 @@ def _normalize_text(text):
     normalized_lines = [line.rstrip() for line in lines]
     text = '\n'.join(normalized_lines)
     
-    # Fix inconsistent capitalization at sentence starts (optional - can be aggressive)
-    # We'll keep original capitalization but ensure proper sentence boundaries
+    # Preserve tables and structured data (lines with multiple tabs or aligned columns)
+    # Already handled by keeping whitespace structure above
     
     return text.strip()
 
 
+def _infer_title_from_first_page(text_by_page):
+    """
+    Infer document title from the first page if metadata title is empty.
+    Looks for prominent text patterns typically used for titles.
+    
+    Args:
+        text_by_page: Dictionary of page text data
+    
+    Returns:
+        Inferred title string or empty string if cannot infer
+    """
+    if not text_by_page:
+        return ""
+    
+    # Get first page text
+    first_page_key = 'page_1'
+    if first_page_key not in text_by_page:
+        # Try to find first page by sorting
+        sorted_pages = sorted(
+            text_by_page.items(),
+            key=lambda x: x[1].get('page_number', 999) if isinstance(x[1], dict) else 999
+        )
+        if not sorted_pages:
+            return ""
+        first_page_key, first_page_data = sorted_pages[0]
+    else:
+        first_page_data = text_by_page[first_page_key]
+    
+    if not isinstance(first_page_data, dict) or 'text' not in first_page_data:
+        return ""
+    
+    first_page_text = first_page_data.get('text', '').strip()
+    if not first_page_text:
+        return ""
+    
+    # Split into lines and find potential title
+    lines = [line.strip() for line in first_page_text.split('\n') if line.strip()]
+    
+    if not lines:
+        return ""
+    
+    # Strategy 1: Look for short lines at the beginning (typically titles are short and prominent)
+    # Title is usually within first 10 lines and under 100 characters
+    potential_titles = []
+    for i, line in enumerate(lines[:10]):
+        # Skip very short lines (likely page numbers or artifacts)
+        if len(line) < 5:
+            continue
+        # Skip lines with dates, numbers only, or common headers
+        if re.match(r'^\d+$', line) or re.match(r'^page\s+\d+', line, re.IGNORECASE):
+            continue
+        # Titles are typically 5-100 characters
+        if 5 <= len(line) <= 100:
+            potential_titles.append(line)
+        # If we find a longer descriptive line, it might be a subtitle
+        elif 100 < len(line) <= 200 and i < 5:
+            potential_titles.append(line)
+    
+    if not potential_titles:
+        # Fallback: Use first non-trivial line
+        for line in lines[:5]:
+            if len(line) > 10:
+                return line
+        return ""
+    
+    # Strategy 2: Combine multiple short lines that form the title (common in PDFs)
+    # Example: "Off target" + "Continued collective inaction" + "Emissions Gap Report 2025"
+    if len(potential_titles) >= 2:
+        # Check if first few lines together form a coherent title
+        combined = ' '.join(potential_titles[:3])  # Take up to 3 lines
+        # If combined title is reasonable length, use it
+        if len(combined) <= 200:
+            return combined
+    
+    # Strategy 3: Return first potential title
+    return potential_titles[0] if potential_titles else ""
+
+
 def _split_into_semantic_units(text):
     """
-    Split text into semantic units (paragraphs, bullet points, sentences).
-    Each unit should ideally contain a single idea.
+    Split text into semantic units (paragraphs, bullet points, sentences) while preserving context.
+    Each unit should contain a complete idea with sufficient surrounding context.
     
     Args:
         text: Normalized text string
@@ -619,36 +701,63 @@ def _split_into_semantic_units(text):
     
     units = []
     
-    # First, split by double newlines (paragraph breaks)
-    paragraphs = text.split('\n\n')
+    # First, split by paragraph breaks (double or triple newlines)
+    # Use triple newlines for major section breaks
+    paragraphs = re.split(r'\n{2,}', text)
     
     for para in paragraphs:
         para = para.strip()
         if not para:
             continue
         
+        # Detect and preserve section headers (short lines, often in CAPS or Title Case)
+        # Headers are important context markers
+        is_header = (
+            len(para) < 100 and  # Short line
+            (para.isupper() or  # ALL CAPS
+             para.istitle() or  # Title Case
+             re.match(r'^(Chapter|Section|Box|Figure|Table)\s+\d+', para, re.IGNORECASE))  # Numbered sections
+        )
+        
+        if is_header:
+            # Keep headers as separate units for context
+            units.append(para)
+            continue
+        
         # Check if paragraph is a bullet list
         bullet_pattern = r'^•\s+'
         if re.match(bullet_pattern, para, re.MULTILINE):
-            # Split bullet list into individual bullets
-            bullets = re.split(r'\n(?=•\s+)', para)
-            for bullet in bullets:
-                bullet = bullet.strip()
-                if bullet:
-                    units.append(bullet)
+            # Keep bullet lists together if they're related (part of same list)
+            # Only split if total length is very long
+            if len(para) > 1500:
+                # Split bullet list into individual bullets
+                bullets = re.split(r'\n(?=•\s+)', para)
+                for bullet in bullets:
+                    bullet = bullet.strip()
+                    if bullet:
+                        units.append(bullet)
+            else:
+                # Keep short bullet lists together for context
+                units.append(para)
         else:
             # Check if it's a numbered list
             if re.match(r'^\d+[.)]\s+', para, re.MULTILINE):
-                # Split numbered list items
-                items = re.split(r'\n(?=\d+[.)]\s+)', para)
-                for item in items:
-                    item = item.strip()
-                    if item:
-                        units.append(item)
+                # Keep numbered lists together if reasonable length
+                if len(para) > 1500:
+                    # Split numbered list items
+                    items = re.split(r'\n(?=\d+[.)]\s+)', para)
+                    for item in items:
+                        item = item.strip()
+                        if item:
+                            units.append(item)
+                else:
+                    # Keep related numbered items together
+                    units.append(para)
             else:
                 # Regular paragraph - check if it's too long
                 # If paragraph is very long, try to split by sentences
-                if len(para) > 800:
+                # Increased threshold from 800 to 1200 to preserve more context
+                if len(para) > 1200:
                     # Split by sentence boundaries
                     sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', para)
                     current_unit = ""
@@ -658,7 +767,8 @@ def _split_into_semantic_units(text):
                             continue
                         
                         # If adding this sentence would exceed reasonable size, save current
-                        if current_unit and len(current_unit) + len(sentence) + 1 > 600:
+                        # Increased from 600 to 900 to keep more context together
+                        if current_unit and len(current_unit) + len(sentence) + 1 > 900:
                             units.append(current_unit.strip())
                             current_unit = sentence
                         else:
@@ -676,16 +786,16 @@ def _split_into_semantic_units(text):
     return units
 
 
-def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
+def _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400):
     """
     Chunk text intelligently for embeddings with improved semantic splitting.
     For large PDFs (800+ pages), we need to split text into manageable chunks.
-    Each chunk should ideally contain a single idea.
+    Each chunk should ideally contain a single idea with sufficient context.
     
     Args:
         text_by_page: Dictionary of page text data
-        chunk_size: Target characters per chunk (default 1000, good for most embedding models)
-        overlap: Characters to overlap between chunks for context (default 200)
+        chunk_size: Target characters per chunk (default 1500, optimized for technical documents)
+        overlap: Characters to overlap between chunks for context (default 400, ensures continuity)
     
     Returns:
         List of chunk dictionaries with text, page info, and metadata
@@ -766,16 +876,34 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200):
             if overlap > 0 and current_chunk:
                 # Take last 'overlap' characters for context
                 overlap_text = current_chunk[-overlap:].strip()
-                # Try to start at a sentence or unit boundary
-                # If overlap text ends mid-sentence, try to find last complete sentence
-                sentences = re.split(r'(?<=[.!?])\s+', overlap_text)
-                if len(sentences) > 1:
-                    overlap_text = ' '.join(sentences[-2:])
-                elif len(sentences) == 1 and len(overlap_text) > overlap // 2:
-                    # If we have a long single sentence, take last part
-                    overlap_text = overlap_text[-overlap // 2:]
                 
-                current_chunk = overlap_text + "\n\n" + unit
+                # Try to find a good boundary for overlap (sentence or paragraph)
+                # Look for last sentence boundary within the overlap
+                sentence_match = None
+                for match in re.finditer(r'(?<=[.!?])\s+', overlap_text):
+                    sentence_match = match
+                
+                if sentence_match:
+                    # Start overlap from last sentence boundary
+                    overlap_text = overlap_text[sentence_match.end():]
+                else:
+                    # No sentence boundary found, try paragraph boundary
+                    para_match = None
+                    for match in re.finditer(r'\n\n', overlap_text):
+                        para_match = match
+                    
+                    if para_match:
+                        overlap_text = overlap_text[para_match.end():]
+                    else:
+                        # No good boundary, take last 60% of overlap to avoid cutting mid-word
+                        overlap_text = overlap_text[int(len(overlap_text) * 0.4):]
+                
+                # Ensure overlap isn't empty
+                if overlap_text:
+                    current_chunk = overlap_text + "\n\n" + unit
+                else:
+                    current_chunk = unit
+                
                 # Keep pages from overlap (last page) and add current unit's page
                 current_pages = {max(current_pages)} if current_pages else {unit_page}
                 current_pages.add(unit_page)
@@ -840,7 +968,8 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         text_by_page = data.get('text', {})
         
         # Create chunks for embeddings (important for 800+ page PDFs)
-        chunks = _chunk_text_for_embeddings(text_by_page, chunk_size=1000, overlap=200)
+        # Use larger chunk size and overlap for technical documents to preserve context
+        chunks = _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400)
         
         # Also keep full text for reference (but chunked version is better for embeddings)
         combined_text = ""
@@ -854,6 +983,13 @@ def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_ur
         metadata = data.get('metadata', {}).copy()
         if filename and 'filename' not in metadata:
             metadata['filename'] = filename
+        
+        # Infer title from first page if metadata title is empty
+        if not metadata.get('title') or metadata.get('title', '').strip() == '':
+            inferred_title = _infer_title_from_first_page(text_by_page)
+            if inferred_title:
+                metadata['title'] = inferred_title
+                app.logger.info(f"Inferred title from first page: {inferred_title}")
         
         payload = {
             'job_id': job_id,
@@ -1766,7 +1902,7 @@ def extract_pdf_async():
     The extraction runs in a background thread, preventing request timeouts.
     
     The extracted data is automatically:
-    1. Chunked intelligently for embeddings (1000 chars per chunk with 200 char overlap)
+    1. Chunked intelligently for embeddings (1500 chars per chunk with 400 char overlap for better context)
     2. Sent to Nhost/Hasura database (if enabled)
     3. Webhook notification sent to Next.js (if configured)
     

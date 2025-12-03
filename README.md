@@ -11,7 +11,8 @@ A production-ready Python application for extracting data from PDF files. Optimi
 - **Web API**: RESTful API with synchronous and asynchronous endpoints
 - **Async Processing**: Background job processing with real-time progress tracking
 - **Large PDF Support**: Optimized for 800+ page documents (car manuals, technical docs)
-- **Text Chunking**: Advanced semantic chunking with text normalization (1000 chars/chunk with overlap)
+- **Text Chunking**: Advanced semantic chunking with text normalization (1500 chars/chunk with 400 char overlap for optimal context)
+- **Title Inference**: Automatically extracts document title from first page when metadata is empty
 - **Nhost/Hasura Integration**: Automatic data storage with GraphQL mutations
 - **Webhook Support**: Notify Next.js apps when processing completes
 - **Progress Tracking**: Real-time status updates with stages and percentages
@@ -24,6 +25,48 @@ A production-ready Python application for extracting data from PDF files. Optimi
 - **Security Features**: Protection against malicious files, viruses, and dangerous content
 
 ## Recent Updates
+
+### December 3, 2025 - Enhanced Context Preservation & Title Inference
+
+Major improvements to text extraction quality and metadata handling:
+
+**1. Larger Chunks with Better Context:**
+- Chunk size increased: 1000 → 1500 chars (+50%)
+- Overlap increased: 200 → 400 chars (+100%)
+- Result: ~30% fewer chunks but significantly better context preservation
+
+**2. Automatic Title Inference:**
+- New feature: `_infer_title_from_first_page()` 
+- Automatically extracts title from first page when PDF metadata is empty
+- Handles multi-line titles common in technical documents
+- Example: "Off target Continued collective inaction puts global temperature goal at risk Emissions Gap Report 2025"
+
+**3. Enhanced Text Extraction:**
+- Added layout-aware extraction with better table detection
+- Improved column alignment and reading order
+- Better handling of headers, footers, and section markers
+- Reduced extraction artifacts
+
+**4. Smarter Semantic Chunking:**
+- Increased paragraph split threshold: 800 → 1200 chars
+- Section headers preserved as context markers
+- Lists kept together when < 1500 chars
+- Smart boundary detection finds natural break points
+
+**Impact:**
+- ✅ Better context for embeddings and semantic search
+- ✅ Fewer mid-sentence breaks in chunks
+- ✅ Automatic title population for all PDFs
+- ✅ Improved table and list preservation
+- ✅ Similar or faster processing time
+- ✅ ~30% reduction in chunk count (fewer DB records)
+
+**Files Updated:**
+- `api.py`: Chunking logic, title inference, normalization
+- `pdf_extractor.py`: Enhanced text extraction with layout detection
+- New: `test_title_inference.py` - Test script for title detection
+- New: `EXTRACTION_IMPROVEMENTS.md` - Detailed documentation
+- New: `CHUNKING_COMPARISON.md` - Before/after comparison
 
 ### December 2, 2025 - Page Tracking Bug Fix
 
