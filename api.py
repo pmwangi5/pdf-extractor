@@ -565,7 +565,7 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id, content_type='applic
 def _normalize_text(text):
     """
     Normalize text by removing inconsistent formatting while preserving important structure.
-    Improved to maintain more context and semantic meaning.
+    Aggressively removes PDF layout whitespace while maintaining readability.
     
     Args:
         text: Raw text string
@@ -576,33 +576,37 @@ def _normalize_text(text):
     if not text:
         return ""
     
-    # Preserve section headers and titles (lines in ALL CAPS or Title Case)
-    # These are important for document structure
+    # First pass: Remove lines that are only whitespace or nearly empty
+    lines = text.split('\n')
+    content_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Only keep lines with actual content (more than just a few chars of whitespace/symbols)
+        if len(stripped) > 0:
+            content_lines.append(stripped)
+    
+    # Rejoin with single newlines
+    text = '\n'.join(content_lines)
     
     # Normalize line breaks - replace multiple newlines with double newline (paragraph break)
-    # But preserve up to triple newlines for section breaks
-    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     
     # Remove hyphenation artifacts (hyphen at end of line followed by word on next line)
     # Pattern: word-\nword becomes wordword
-    # Be careful not to remove intentional hyphens
     text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
     
     # Normalize bullet points - convert various bullet styles to consistent •
-    # Match common bullet patterns: -, *, •, o, ▶, etc.
+    # Match common bullet patterns: -, *, •, o, ▶, ►, etc.
     text = re.sub(r'^\s*[-*•o▶►]\s+', '• ', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+[.)]\s+', r'\g<0>', text)  # Keep numbered lists as-is
     
-    # Normalize whitespace - multiple spaces to single space (but preserve paragraph breaks)
-    text = re.sub(r'[ \t]+', ' ', text)
+    # Normalize whitespace - multiple spaces to single space
+    # This is critical for removing PDF layout spacing
+    text = re.sub(r'  +', ' ', text)  # 2 or more spaces become 1
+    text = re.sub(r'[ \t]+', ' ', text)  # Any tabs/spaces combo become single space
     
-    # Remove trailing whitespace from lines but keep paragraph structure
-    lines = text.split('\n')
-    normalized_lines = [line.rstrip() for line in lines]
-    text = '\n'.join(normalized_lines)
-    
-    # Preserve tables and structured data (lines with multiple tabs or aligned columns)
-    # Already handled by keeping whitespace structure above
+    # Remove any remaining excessive newlines
+    text = re.sub(r'\n\n+', '\n\n', text)
     
     return text.strip()
 
