@@ -524,7 +524,7 @@ def upload_to_spaces(file_path, filename, pdf_embedding_id, content_type='applic
             s3_key,
             ExtraArgs={
                 'ContentType': content_type,
-                'ACL': 'private'  # Change to 'public-read' if you want public access
+                'ACL': 'public-read'  # Change to 'public-read' if you want public access
             }
         )
         
