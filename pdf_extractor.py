@@ -1,182 +1,433 @@
 """
 PDF Data Extractor Module
-Provides functionality to extract text, metadata, and tables from PDF files.
+
+Column-aware extraction for multi-column technical manuals (car manuals, service docs, etc.).
+Handles:
+  - 2- and 3-column page layouts (auto-detected per page)
+  - Printed page numbers in chapter-page format (e.g. "7-5", "1-21") from page headers
+  - CID artifact substitution (bullet points, section markers, special chars)
+  - Hyphenation repair across line breaks
+  - ManualsLib / watermark footer stripping
 """
 
+import re
 import pdfplumber
 import PyPDF2
-from typing import Dict, List, Any, Optional
-import json
+from typing import Dict, List, Any, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# CID character substitution map
+# These are the common CID codes found in Subaru / ManualsLib PDFs.
+# Add more as encountered.
+# ---------------------------------------------------------------------------
+CID_MAP = {
+    "(cid:121)": "•",    # bullet
+    "(cid:132)": "■",    # section/filled square
+    "(cid:84)":  "™",    # trademark
+    "(cid:146)": "'",    # right single quote / apostrophe
+    "(cid:147)": "\u201c",  # left double quote
+    "(cid:148)": "\u201d",  # right double quote
+    "(cid:150)": "–",    # en dash
+    "(cid:151)": "—",    # em dash
+    "(cid:160)": " ",    # non-breaking space
+    "(cid:183)": "·",    # middle dot
+}
+
+# Regex that matches any (cid:NNN) token
+_CID_RE = re.compile(r"\(cid:\d+\)")
+
+# Footer lines injected by ManualsLib on every page
+_FOOTER_LINES = {
+    "downloaded from www.manualslib.com manuals search engine",
+    "– continued –",
+}
+
+
+def _substitute_cid(text: str) -> str:
+    """Replace known (cid:NNN) tokens with their Unicode equivalents."""
+    for token, replacement in CID_MAP.items():
+        text = text.replace(token, replacement)
+    # Remove any remaining unknown CID tokens
+    text = _CID_RE.sub("", text)
+    return text
+
+
+def _repair_hyphenation(text: str) -> str:
+    """Join words broken across lines with a hyphen (e.g. 'assem-\nblies' → 'assemblies')."""
+    return re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
+
+
+def _strip_footer_lines(lines: List[str]) -> List[str]:
+    """Remove ManualsLib watermark and '– CONTINUED –' lines."""
+    return [l for l in lines if l.strip().lower() not in _FOOTER_LINES]
+
+
+def _detect_columns(words: List[dict], page_width: float) -> List[Tuple[float, float]]:
+    """
+    Auto-detect column x-ranges from word positions.
+
+    Uses a 5px histogram of word left-edges. A "gap" is any contiguous run
+    of buckets whose raw count is zero (no word starts there). Gaps narrower
+    than MIN_GAP_PX are ignored to avoid splitting on incidental whitespace
+    within a column. Resulting columns narrower than MIN_COL_WIDTH are merged
+    into their neighbour.
+
+    Returns a list of (x_start, x_end) tuples sorted left-to-right.
+    Falls back to a single full-width column if no clear separators are found.
+    """
+    if not words:
+        return [(0, page_width)]
+
+    BUCKET = 5          # px per histogram bucket
+    MIN_GAP_PX = 5      # minimum gap width to qualify as a column separator
+    MIN_COL_WIDTH = 50  # minimum column width in px
+
+    # Build histogram of word left-edges (raw, no smoothing)
+    buckets: Dict[int, int] = {}
+    for w in words:
+        b = int(w["x0"] // BUCKET) * BUCKET
+        buckets[b] = buckets.get(b, 0) + 1
+
+    if not buckets:
+        return [(0, page_width)]
+
+    min_x = min(buckets.keys())
+    max_x = int(max(w["x1"] for w in words) // BUCKET) * BUCKET
+
+    # Find contiguous runs of empty buckets
+    gaps: List[Tuple[int, int]] = []
+    in_gap = False
+    gap_start = 0
+
+    for bx in range(min_x, max_x + BUCKET, BUCKET):
+        empty = buckets.get(bx, 0) == 0
+        if empty:
+            if not in_gap:
+                gap_start = bx
+                in_gap = True
+        else:
+            if in_gap:
+                gap_end = bx
+                if gap_end - gap_start >= MIN_GAP_PX:
+                    gaps.append((gap_start, gap_end))
+                in_gap = False
+
+    if in_gap:
+        gap_end = max_x + BUCKET
+        if gap_end - gap_start >= MIN_GAP_PX:
+            gaps.append((gap_start, gap_end))
+
+    if not gaps:
+        return [(float(min_x), float(max_x + BUCKET))]
+
+    # Build column ranges from gap boundaries
+    cols: List[Tuple[float, float]] = []
+    prev = float(min_x)
+    for gs, ge in gaps:
+        col_end = float(gs)
+        if col_end - prev >= MIN_COL_WIDTH:
+            cols.append((prev, col_end))
+        prev = float(ge)
+
+    final_end = float(max_x + BUCKET)
+    if final_end - prev >= MIN_COL_WIDTH:
+        cols.append((prev, final_end))
+
+    if not cols:
+        return [(float(min_x), float(max_x + BUCKET))]
+
+    # Extend the first column's left edge and last column's right edge
+    # to capture words that fall just outside the histogram bucket boundaries
+    actual_min_x = float(min(w["x0"] for w in words))
+    actual_max_x = float(max(w["x1"] for w in words))
+    cols[0] = (min(cols[0][0], actual_min_x - 1), cols[0][1])
+    cols[-1] = (cols[-1][0], max(cols[-1][1], actual_max_x + 1))
+
+    return cols
+
+
+def _words_to_text(words: List[dict], y_tolerance: float = 4.0) -> str:
+    """
+    Reconstruct text from a list of word dicts, grouping by y-position into lines.
+    Words must already be filtered to a single column.
+    """
+    if not words:
+        return ""
+
+    # Sort by top (y), then x within the same line
+    sorted_words = sorted(words, key=lambda w: (round(w["top"] / y_tolerance) * y_tolerance, w["x0"]))
+
+    lines: List[str] = []
+    current_line: List[str] = []
+    current_top: Optional[float] = None
+
+    for w in sorted_words:
+        if current_top is None or abs(w["top"] - current_top) > y_tolerance:
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [w["text"]]
+            current_top = w["top"]
+        else:
+            current_line.append(w["text"])
+
+    if current_line:
+        lines.append(" ".join(current_line))
+
+    return "\n".join(lines)
+
+
+def _extract_header_info(all_words: List[dict], page_height: float) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract printed page number and chapter name directly from the header band words.
+
+    The header band is the top ~270 units of the page (before main content).
+    Page numbers appear as isolated "N-NN" or "N" tokens; everything else is the chapter name.
+
+    Returns:
+        (printed_page_number, chapter_name)  — either may be None.
+    """
+    # Collect words in the header band
+    header_words = [w for w in all_words if float(w["top"]) < 270]
+    if not header_words:
+        return None, None
+
+    # Reconstruct header as a flat left-to-right string
+    header_sorted = sorted(header_words, key=lambda w: w["x0"])
+    tokens = [w["text"] for w in header_sorted]
+
+    # Find the page number token: matches "N-NN" or a plain integer
+    _pnum_re = re.compile(r"^\d+-\d+$|^\d+$")
+    page_num = None
+    chapter_tokens = []
+    for t in tokens:
+        clean = _substitute_cid(t).strip()
+        if _pnum_re.match(clean) and page_num is None:
+            page_num = clean
+        else:
+            chapter_tokens.append(clean)
+
+    chapter = " ".join(chapter_tokens).strip() or None
+    return page_num, chapter
+
+
+def _extract_page_text(page) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Extract clean text from a single pdfplumber page.
+
+    Returns:
+        (text, printed_page_number, chapter_name)
+
+    Strategy:
+      1. Extract all words with positions.
+      2. Parse header band separately for page number + chapter name.
+      3. Auto-detect columns in the body area.
+      4. Reconstruct each column's text in reading order.
+      5. Concatenate columns with a blank line separator.
+      6. Clean up: CID substitution, hyphenation repair, footer removal.
+    """
+    page_w = float(page.width)
+    page_h = float(page.height)
+
+    # Extract all words, excluding the very bottom strip (ManualsLib footer)
+    all_words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
+    content_words = [w for w in all_words if float(w["top"]) < page_h - 12]
+
+    if not content_words:
+        return "", None, None
+
+    # Extract page number and chapter from the header band
+    printed_page_num, chapter_name = _extract_header_info(all_words, page_h)
+
+    # Detect columns in the full content area
+    columns = _detect_columns(content_words, page_w)
+
+    # Extract text per column
+    column_texts = []
+    for col_start, col_end in columns:
+        col_words = [w for w in content_words if w["x0"] >= col_start - 2 and w["x0"] < col_end + 2]
+        col_text = _words_to_text(col_words)
+        if col_text.strip():
+            column_texts.append(col_text)
+
+    # Join columns
+    raw_text = "\n\n".join(column_texts)
+
+    # Clean up
+    raw_text = _substitute_cid(raw_text)
+    raw_text = _repair_hyphenation(raw_text)
+
+    # Remove footer lines
+    lines = raw_text.split("\n")
+    lines = _strip_footer_lines(lines)
+    clean_text = "\n".join(lines).strip()
+
+    return clean_text, printed_page_num, chapter_name
 
 
 class PDFExtractor:
-    """Extract data from PDF files including text, metadata, and tables."""
-    
+    """
+    Extract text, metadata, and tables from PDF files.
+
+    Designed for multi-column technical manuals (car manuals, service docs).
+    Tracks both the PDF page index (1-based) and the printed page number
+    embedded in the document header (e.g. "7-5", "1-21").
+    """
+
     def __init__(self, pdf_path: str):
-        """
-        Initialize PDF extractor with a PDF file path.
-        
-        Args:
-            pdf_path: Path to the PDF file
-        """
         self.pdf_path = pdf_path
-        self.pdfplumber_pdf = None
-        self.pypdf2_pdf = None
-        
-    def _load_pdf(self):
-        """Load PDF using both libraries for different extraction needs."""
-        if self.pdfplumber_pdf is None:
-            self.pdfplumber_pdf = pdfplumber.open(self.pdf_path)
-        if self.pypdf2_pdf is None:
-            # PyPDF2.PdfReader can take a file path directly, which handles file opening/closing internally
-            self.pypdf2_pdf = PyPDF2.PdfReader(self.pdf_path)
-    
+        self._plumber_pdf = None
+        self._pypdf2_pdf = None
+
+    def _load(self):
+        if self._plumber_pdf is None:
+            self._plumber_pdf = pdfplumber.open(self.pdf_path)
+        if self._pypdf2_pdf is None:
+            self._pypdf2_pdf = PyPDF2.PdfReader(self.pdf_path)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def extract_metadata(self) -> Dict[str, Any]:
         """
-        Extract metadata from PDF.
-        
-        Returns:
-            Dictionary containing PDF metadata
+        Extract PDF document metadata (title, author, page count, etc.).
         """
-        self._load_pdf()
-        metadata = {}
-        
-        # Extract using PyPDF2
-        if self.pypdf2_pdf.metadata:
-            metadata = {
-                'title': self.pypdf2_pdf.metadata.get('/Title', ''),
-                'author': self.pypdf2_pdf.metadata.get('/Author', ''),
-                'subject': self.pypdf2_pdf.metadata.get('/Subject', ''),
-                'creator': self.pypdf2_pdf.metadata.get('/Creator', ''),
-                'producer': self.pypdf2_pdf.metadata.get('/Producer', ''),
-                'creation_date': str(self.pypdf2_pdf.metadata.get('/CreationDate', '')),
-                'modification_date': str(self.pypdf2_pdf.metadata.get('/ModDate', '')),
+        self._load()
+        meta = {}
+
+        if self._pypdf2_pdf.metadata:
+            raw = self._pypdf2_pdf.metadata
+            meta = {
+                "title":             raw.get("/Title", "") or "",
+                "author":            raw.get("/Author", "") or "",
+                "subject":           raw.get("/Subject", "") or "",
+                "creator":           raw.get("/Creator", "") or "",
+                "producer":          raw.get("/Producer", "") or "",
+                "creation_date":     str(raw.get("/CreationDate", "") or ""),
+                "modification_date": str(raw.get("/ModDate", "") or ""),
             }
-        
-        # Add additional info
-        metadata['num_pages'] = len(self.pypdf2_pdf.pages)
-        metadata['is_encrypted'] = self.pypdf2_pdf.is_encrypted
-        
-        return metadata
-    
+
+        meta["num_pages"]    = len(self._pypdf2_pdf.pages)
+        meta["is_encrypted"] = self._pypdf2_pdf.is_encrypted
+
+        return meta
+
     def extract_text(self, pages: Optional[List[int]] = None) -> Dict[str, Any]:
         """
-        Extract text from PDF pages with aggressive whitespace cleanup.
-        
+        Extract text from PDF pages with column-aware reconstruction.
+
         Args:
-            pages: List of page numbers to extract (0-indexed). If None, extracts all pages.
-        
+            pages: 0-indexed list of PDF page indices to extract.
+                   None = all pages.
+
         Returns:
-            Dictionary with page numbers as keys and extracted text as values
+            Dict keyed by "page_N" (1-based PDF index), each value:
+            {
+                "pdf_page":          int,   # 1-based PDF page index
+                "printed_page":      str,   # printed number in doc header e.g. "7-5" (or None)
+                "chapter":           str,   # chapter/section name from header (or None)
+                "text":              str,   # clean extracted text
+                "char_count":        int,
+            }
         """
-        self._load_pdf()
-        text_data = {}
-        
+        self._load()
+        total = len(self._plumber_pdf.pages)
+
         if pages is None:
-            pages = range(len(self.pdfplumber_pdf.pages))
-        
-        # Extraction settings WITHOUT layout=True to avoid excessive whitespace
-        # layout=True preserves visual positioning which creates huge char counts
-        extraction_settings = {
-            'x_tolerance': 3,  # Horizontal tolerance for character grouping
-            'y_tolerance': 3,  # Vertical tolerance for line grouping
-            'keep_blank_chars': False,  # Remove blank characters
-        }
-        
-        for page_num in pages:
-            if 0 <= page_num < len(self.pdfplumber_pdf.pages):
-                page = self.pdfplumber_pdf.pages[page_num]
-                
-                # Extract text with settings
-                text = page.extract_text(**extraction_settings)
-                
-                # Fallback to basic extraction if enhanced fails
-                if not text:
-                    text = page.extract_text()
-                
-                # Aggressive whitespace cleanup to remove layout spacing
-                if text:
-                    import re
-                    # Remove lines that are only whitespace
-                    lines = text.split('\n')
-                    cleaned_lines = []
-                    for line in lines:
-                        # Strip leading/trailing whitespace
-                        cleaned_line = line.strip()
-                        # Only keep non-empty lines
-                        if cleaned_line:
-                            cleaned_lines.append(cleaned_line)
-                    text = '\n'.join(cleaned_lines)
-                
-                text_data[f'page_{page_num + 1}'] = {
-                    'page_number': page_num + 1,
-                    'text': text if text else '',
-                    'char_count': len(text) if text else 0
-                }
-        
-        return text_data
-    
+            pages = range(total)
+
+        result = {}
+        for page_idx in pages:
+            if not (0 <= page_idx < total):
+                continue
+
+            page = self._plumber_pdf.pages[page_idx]
+            text, printed_page, chapter = _extract_page_text(page)
+
+            result[f"page_{page_idx + 1}"] = {
+                "pdf_page":     page_idx + 1,
+                "printed_page": printed_page,
+                "chapter":      chapter,
+                "text":         text,
+                "char_count":   len(text),
+            }
+
+        return result
+
     def extract_tables(self, pages: Optional[List[int]] = None) -> Dict[str, Any]:
         """
         Extract tables from PDF pages.
-        
+
         Args:
-            pages: List of page numbers to extract (0-indexed). If None, extracts all pages.
-        
+            pages: 0-indexed list of PDF page indices. None = all pages.
+
         Returns:
-            Dictionary with page numbers as keys and extracted tables as values
+            Dict keyed by "page_N" (1-based), each value:
+            {
+                "pdf_page":     int,
+                "printed_page": str or None,
+                "num_tables":   int,
+                "tables":       list of 2D lists,
+            }
         """
-        self._load_pdf()
-        tables_data = {}
-        
+        self._load()
+        total = len(self._plumber_pdf.pages)
+
         if pages is None:
-            pages = range(len(self.pdfplumber_pdf.pages))
-        
-        for page_num in pages:
-            if 0 <= page_num < len(self.pdfplumber_pdf.pages):
-                page = self.pdfplumber_pdf.pages[page_num]
-                tables = page.extract_tables()
-                
-                if tables:
-                    tables_data[f'page_{page_num + 1}'] = {
-                        'page_number': page_num + 1,
-                        'num_tables': len(tables),
-                        'tables': [table for table in tables]
-                    }
-        
-        return tables_data
-    
+            pages = range(total)
+
+        result = {}
+        for page_idx in pages:
+            if not (0 <= page_idx < total):
+                continue
+
+            page = self._plumber_pdf.pages[page_idx]
+            tables = page.extract_tables()
+
+            if tables:
+                # Get printed page number for cross-reference
+                _, printed_page, _ = _extract_page_text(page)
+
+                result[f"page_{page_idx + 1}"] = {
+                    "pdf_page":     page_idx + 1,
+                    "printed_page": printed_page,
+                    "num_tables":   len(tables),
+                    "tables":       tables,
+                }
+
+        return result
+
     def extract_all(self, include_tables: bool = True) -> Dict[str, Any]:
         """
-        Extract all available data from PDF.
-        
+        Extract all data from the PDF in a single pass.
+
         Args:
-            include_tables: Whether to extract tables (can be slow for large PDFs)
-        
+            include_tables: Set False to skip table extraction (much faster for large docs).
+
         Returns:
-            Dictionary containing all extracted data
+            {
+                "metadata": {...},
+                "text":     {"page_N": {...}, ...},
+                "tables":   {"page_N": {...}, ...},  # only if include_tables=True
+            }
         """
-        result = {
-            'metadata': self.extract_metadata(),
-            'text': self.extract_text(),
+        result: Dict[str, Any] = {
+            "metadata": self.extract_metadata(),
+            "text":     self.extract_text(),
         }
-        
         if include_tables:
-            result['tables'] = self.extract_tables()
-        
+            result["tables"] = self.extract_tables()
         return result
-    
+
     def close(self):
-        """Close PDF file handles."""
-        if self.pdfplumber_pdf:
-            self.pdfplumber_pdf.close()
-        self.pdfplumber_pdf = None
-        self.pypdf2_pdf = None
-    
+        if self._plumber_pdf:
+            self._plumber_pdf.close()
+        self._plumber_pdf = None
+        self._pypdf2_pdf = None
+
     def __enter__(self):
-        """Context manager entry."""
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
         self.close()

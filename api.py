@@ -32,6 +32,23 @@ import boto3
 from botocore.exceptions import ClientError
 from pdf_extractor import PDFExtractor
 
+# OpenAI — soft import so the app starts even without the package
+try:
+    from openai import OpenAI as _OpenAIClient
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Concurrency limiter
+# At most MAX_CONCURRENT_JOBS PDFs may be processed simultaneously.
+# Any request that arrives when all slots are taken gets a 503 immediately.
+# ---------------------------------------------------------------------------
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", 10))
+_concurrency_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
+_active_job_count = 0
+_active_job_lock = threading.Lock()
+
 # Try to import Redis for job storage
 try:
     import redis
@@ -95,6 +112,12 @@ AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID', '')
 AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
 AWS_SES_FROM_EMAIL = os.environ.get('AWS_SES_FROM_EMAIL', '')  # Verified sender email in SES
 AWS_SES_TO_EMAIL = os.environ.get('AWS_SES_TO_EMAIL', '')  # Optional: Default recipient email
+
+# OpenAI configuration (for generating ChatGPT embeddings inline)
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+OPENAI_EMBEDDING_MODEL = os.environ.get('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
+# Max texts per OpenAI embeddings API call (hard limit is 2048; keep lower for safety)
+OPENAI_EMBED_BATCH_SIZE = int(os.environ.get('OPENAI_EMBED_BATCH_SIZE', 200))
 
 # Redis configuration (for job storage on Railway)
 # Railway provides REDIS_URL automatically when Redis service is added
@@ -631,7 +654,7 @@ def _infer_title_from_first_page(text_by_page):
         # Try to find first page by sorting
         sorted_pages = sorted(
             text_by_page.items(),
-            key=lambda x: x[1].get('page_number', 999) if isinstance(x[1], dict) else 999
+            key=lambda x: x[1].get('pdf_page', x[1].get('page_number', 999)) if isinstance(x[1], dict) else 999
         )
         if not sorted_pages:
             return ""
@@ -806,63 +829,72 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400):
     """
     chunks = []
     
-    # Sort pages by page number
+    # Sort pages by pdf_page (new field) or fall back to legacy page_number
     sorted_pages = sorted(
         text_by_page.items(),
-        key=lambda x: x[1].get('page_number', 0) if isinstance(x[1], dict) else 0
+        key=lambda x: x[1].get('pdf_page', x[1].get('page_number', 0)) if isinstance(x[1], dict) else 0
     )
-    
+
     # First pass: normalize all text and split into semantic units
     all_units = []
-    unit_to_page = {}  # Map unit index to page number
-    
+    unit_to_page = {}       # Map unit index → pdf_page (int)
+    unit_to_printed = {}    # Map unit index → printed_page (str, e.g. "7-5")
+    unit_to_chapter = {}    # Map unit index → chapter name
+
     for page_key, page_data in sorted_pages:
         if not isinstance(page_data, dict) or 'text' not in page_data:
             continue
-            
+
         page_text = page_data.get('text', '')
-        page_num = page_data.get('page_number', 0)
-        
+        # Support both new field name (pdf_page) and legacy (page_number)
+        page_num = page_data.get('pdf_page', page_data.get('page_number', 0))
+        printed_page = page_data.get('printed_page')
+        chapter = page_data.get('chapter')
+
         if not page_text.strip():
             continue
-        
+
         # Normalize the page text
         normalized_text = _normalize_text(page_text)
-        
+
         # Sanitize text for embeddings (remove dangerous content)
         sanitized_text = sanitize_text_for_embeddings(normalized_text)
-        
+
         # Detect dangerous content (log warnings only, don't block processing)
-        # Uses specific patterns to avoid false positives from normal text
         try:
             is_dangerous, reason = detect_dangerous_content(sanitized_text)
             if is_dangerous:
                 app.logger.warning(f"Dangerous content detected in page {page_num}: {reason}")
         except Exception as e:
-            # If detection fails, log but don't break processing
             app.logger.warning(f"Error in dangerous content detection for page {page_num}: {str(e)}")
         
         # Split into semantic units
         units = _split_into_semantic_units(sanitized_text)
-        
+
         # Track which page each unit belongs to
         for unit in units:
             unit_index = len(all_units)
             all_units.append(unit)
             unit_to_page[unit_index] = page_num
-    
+            unit_to_printed[unit_index] = printed_page
+            unit_to_chapter[unit_index] = chapter
+
     # Second pass: combine units into chunks
     current_chunk = ""
     current_pages = set()
+    current_printed_pages = set()
+    current_chapters = set()
     chunk_index = 0
-    
+
     for i, unit in enumerate(all_units):
         unit_page = unit_to_page.get(i, 0)
-        
+        unit_printed = unit_to_printed.get(i)
+        unit_chapter = unit_to_chapter.get(i)
+
         # Check if adding this unit would exceed chunk size
         unit_with_separator = "\n\n" + unit if current_chunk else unit
         potential_chunk_size = len(current_chunk) + len(unit_with_separator)
-        
+
         if current_chunk and potential_chunk_size > chunk_size:
             # Save current chunk
             if current_chunk.strip():
@@ -870,50 +902,49 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400):
                     'chunk_index': chunk_index,
                     'text': current_chunk.strip(),
                     'pages': sorted(list(current_pages)),
+                    'printed_pages': sorted([p for p in current_printed_pages if p], key=lambda x: str(x)),
+                    'chapters': sorted([c for c in current_chapters if c]),
                     'char_count': len(current_chunk),
                     'start_page': min(current_pages) if current_pages else 0,
-                    'end_page': max(current_pages) if current_pages else 0
+                    'end_page': max(current_pages) if current_pages else 0,
                 })
                 chunk_index += 1
-            
+
             # Start new chunk with overlap from previous
             if overlap > 0 and current_chunk:
-                # Take last 'overlap' characters for context
                 overlap_text = current_chunk[-overlap:].strip()
-                
+
                 # Try to find a good boundary for overlap (sentence or paragraph)
-                # Look for last sentence boundary within the overlap
                 sentence_match = None
                 for match in re.finditer(r'(?<=[.!?])\s+', overlap_text):
                     sentence_match = match
-                
+
                 if sentence_match:
-                    # Start overlap from last sentence boundary
                     overlap_text = overlap_text[sentence_match.end():]
                 else:
-                    # No sentence boundary found, try paragraph boundary
                     para_match = None
                     for match in re.finditer(r'\n\n', overlap_text):
                         para_match = match
-                    
+
                     if para_match:
                         overlap_text = overlap_text[para_match.end():]
                     else:
-                        # No good boundary, take last 60% of overlap to avoid cutting mid-word
                         overlap_text = overlap_text[int(len(overlap_text) * 0.4):]
-                
-                # Ensure overlap isn't empty
+
                 if overlap_text:
                     current_chunk = overlap_text + "\n\n" + unit
                 else:
                     current_chunk = unit
-                
-                # Keep pages from overlap (last page) and add current unit's page
+
                 current_pages = {max(current_pages)} if current_pages else {unit_page}
                 current_pages.add(unit_page)
+                current_printed_pages = {unit_printed} if unit_printed else set()
+                current_chapters = {unit_chapter} if unit_chapter else set()
             else:
                 current_chunk = unit
                 current_pages = {unit_page}
+                current_printed_pages = {unit_printed} if unit_printed else set()
+                current_chapters = {unit_chapter} if unit_chapter else set()
         else:
             # Add unit to current chunk
             if current_chunk:
@@ -921,16 +952,22 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400):
             else:
                 current_chunk = unit
             current_pages.add(unit_page)
-    
+            if unit_printed:
+                current_printed_pages.add(unit_printed)
+            if unit_chapter:
+                current_chapters.add(unit_chapter)
+
     # Add final chunk
     if current_chunk.strip():
         chunks.append({
             'chunk_index': chunk_index,
             'text': current_chunk.strip(),
             'pages': sorted(list(current_pages)),
+            'printed_pages': sorted([p for p in current_printed_pages if p], key=lambda x: str(x)),
+            'chapters': sorted([c for c in current_chapters if c]),
             'char_count': len(current_chunk),
             'start_page': min(current_pages) if current_pages else 0,
-            'end_page': max(current_pages) if current_pages else 0
+            'end_page': max(current_pages) if current_pages else 0,
         })
     
     # Limit total chunks per PDF (prevent resource exhaustion)
@@ -941,396 +978,316 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400):
     return chunks
 
 
-def _send_to_nhost(data, job_id, filename, user_id=None, jobs_dict=None, file_url=None, upload_device="web", file_path=None, user_display_name=None):
+def _gql(graphql_url, headers, query, variables, timeout=30):
     """
-    Send extracted data to Nhost for embeddings.
-    For large PDFs, chunks text intelligently for better embedding generation.
-    
+    Execute a single GraphQL operation. Returns the parsed JSON body or raises on HTTP error.
+    GraphQL-level errors are logged and returned as-is so callers can inspect them.
+    """
+    response = requests.post(
+        graphql_url,
+        json={"query": query, "variables": variables},
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _generate_openai_embeddings(texts):
+    """
+    Call the OpenAI embeddings API for a list of texts.
+    Batches automatically to respect OPENAI_EMBED_BATCH_SIZE.
+
+    Returns a list of float lists (one per input text), or None on failure.
+    The returned list is always the same length as `texts`; failed batches
+    produce None entries so callers can still store the chunks without vectors.
+    """
+    if not OPENAI_AVAILABLE:
+        app.logger.warning("openai package not installed – skipping embeddings")
+        return None
+    if not OPENAI_API_KEY:
+        app.logger.warning("OPENAI_API_KEY not set – skipping embeddings")
+        return None
+
+    client = _OpenAIClient(api_key=OPENAI_API_KEY)
+    results = [None] * len(texts)
+
+    for batch_start in range(0, len(texts), OPENAI_EMBED_BATCH_SIZE):
+        batch = texts[batch_start: batch_start + OPENAI_EMBED_BATCH_SIZE]
+        try:
+            resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=batch)
+            for item in resp.data:
+                results[batch_start + item.index] = item.embedding
+            app.logger.debug(
+                f"Embedded batch {batch_start}–{batch_start + len(batch) - 1} "
+                f"({len(batch)} texts, model={OPENAI_EMBEDDING_MODEL})"
+            )
+        except Exception as exc:
+            app.logger.error(f"OpenAI embeddings batch {batch_start} failed: {exc}")
+
+    return results
+
+
+def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
+                upload_device="web", file_path=None, user_display_name=None,
+                progress_cb=None):
+    """
+    Persist a processed PDF to the new tt_ai schema (tt_ai.documents + tt_ai.chunks)
+    and generate ChatGPT embeddings for every chunk inline.
+
+    Pipeline (all in the background thread):
+      1. Upload PDF to DigitalOcean Spaces → get CDN source URL
+      2. Convert first page → JPG → upload → get preview_url
+      3. INSERT tt_ai.documents  (status = 'processing')
+      4. Bulk INSERT tt_ai.chunks (no embeddings yet)
+      5. Generate OpenAI embeddings in batches
+      6. Bulk UPDATE tt_ai.chunks with embedding vectors
+      7. UPDATE tt_ai.documents  (status = 'embedded')
+      8. Send email notification
+
     Args:
-        data: Extracted PDF data
-        job_id: Job identifier
-        filename: Original filename (stored in metadata)
-        user_id: Optional user ID
-        jobs_dict: Optional jobs dictionary for progress updates
-        file_url: Optional URL if file is stored in S3/storage
-        upload_device: Device/platform used for upload (default: 'web')
-        file_path: Optional path to local file for uploading to Spaces after embedding creation
-        user_display_name: Optional display name of the user for email notifications
+        data:               Extracted PDF data dict (keys: metadata, text, tables)
+        job_id:             Unique job identifier
+        filename:           Original filename
+        user_id:            Optional UUID string of the uploading user
+        file_url:           Pre-existing URL (ignored if file_path is provided)
+        upload_device:      Device/platform label (default: 'web')
+        file_path:          Local temp path of the PDF – used for Spaces upload
+        user_display_name:  For email notification
+        progress_cb:        Optional callable(stage: str, pct: int, msg: str)
+
+    Returns:
+        dict with document_id and chunk_count on success, None on failure.
     """
     if not NHOST_BACKEND_URL or not NHOST_ADMIN_SECRET:
-        app.logger.warning("Nhost configuration missing, skipping Nhost integration")
-        app.logger.warning(f"NHOST_BACKEND_URL: {NHOST_BACKEND_URL[:50] if NHOST_BACKEND_URL else 'NOT SET'}...")
-        app.logger.warning(f"NHOST_ADMIN_SECRET: {'SET' if NHOST_ADMIN_SECRET else 'NOT SET'}")
+        app.logger.warning("Nhost not configured – skipping DB storage")
         return None
-    
-    app.logger.info(f"Attempting to send data to Nhost for job {job_id}")
-    app.logger.info(f"Nhost URL: {NHOST_BACKEND_URL}/v1/graphql")
-    
+
+    graphql_url = NHOST_GRAPHQL_URL or f"{NHOST_BACKEND_URL}/v1/graphql"
+    gql_headers = {
+        "Content-Type": "application/json",
+        "x-hasura-admin-secret": NHOST_ADMIN_SECRET,
+    }
+
+    def _progress(stage, pct, msg):
+        if progress_cb:
+            progress_cb(stage, pct, msg)
+        app.logger.info(f"[{job_id}] {stage} ({pct}%) – {msg}")
+
     try:
-        # Prepare data for Nhost
-        # For large PDFs, we chunk the text for embeddings instead of one huge string
-        text_by_page = data.get('text', {})
-        
-        # Create chunks for embeddings (important for 800+ page PDFs)
-        # Use larger chunk size and overlap for technical documents to preserve context
+        # ------------------------------------------------------------------
+        # 1 & 2. Spaces upload (PDF + JPG preview)
+        # ------------------------------------------------------------------
+        source_url = file_url  # fallback if no local file
+        preview_url = None
+
+        if file_path and os.path.exists(file_path):
+            _progress("spaces_upload", 5, "Uploading PDF to Spaces…")
+            source_url = upload_to_spaces(
+                file_path, filename, job_id, content_type="application/pdf"
+            )
+            if source_url:
+                app.logger.info(f"PDF uploaded to Spaces: {source_url}")
+                jpg_path = convert_pdf_first_page_to_jpg(file_path)
+                if jpg_path and os.path.exists(jpg_path):
+                    jpg_filename = os.path.splitext(secure_filename(filename))[0] + "_preview.jpg"
+                    preview_url = upload_to_spaces(
+                        jpg_path, jpg_filename, job_id, content_type="image/jpeg"
+                    )
+                    try:
+                        os.remove(jpg_path)
+                    except Exception:
+                        pass
+                    if preview_url:
+                        app.logger.info(f"Preview JPG uploaded: {preview_url}")
+            else:
+                app.logger.warning("Spaces upload failed – document will have no source URL")
+
+        # ------------------------------------------------------------------
+        # 3. Build chunks
+        # ------------------------------------------------------------------
+        text_by_page = data.get("text", {})
         chunks = _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400)
-        
-        # Also keep full text for reference (but chunked version is better for embeddings)
-        combined_text = ""
-        if text_by_page:
-            for page_key, page_data in text_by_page.items():
-                if isinstance(page_data, dict) and 'text' in page_data:
-                    combined_text += page_data['text'] + "\n\n"
-        
-        # Prepare payload for Nhost
-        # Store filename in metadata for reference
-        metadata = data.get('metadata', {}).copy()
-        if filename and 'filename' not in metadata:
-            metadata['filename'] = filename
-        
-        # Infer title from first page if metadata title is empty
-        if not metadata.get('title') or metadata.get('title', '').strip() == '':
-            inferred_title = _infer_title_from_first_page(text_by_page)
-            if inferred_title:
-                metadata['title'] = inferred_title
-                app.logger.info(f"Inferred title from first page: {inferred_title}")
-        
-        payload = {
-            'job_id': job_id,
-            'metadata': metadata,
-            'text': combined_text,
-            'text_by_page': data.get('text', {}),
-            'tables': data.get('tables', {}),
-            'status': 'ready_for_embedding'
-        }
-        
-        # Send to Nhost GraphQL endpoint or REST endpoint
-        # This example uses a REST endpoint - adjust based on your Nhost setup
-        headers = {
-            'Content-Type': 'application/json',
-            'x-hasura-admin-secret': NHOST_ADMIN_SECRET
-        }
-        
-        # GraphQL mutation endpoint
-        # Use NHOST_GRAPHQL_URL if set, otherwise construct from NHOST_BACKEND_URL
-        if NHOST_GRAPHQL_URL:
-            graphql_url = NHOST_GRAPHQL_URL
-        else:
-            # Default: append /v1/graphql to backend URL
-            # If this doesn't work, set NHOST_GRAPHQL_URL environment variable
-            # with the exact GraphQL endpoint from your Nhost dashboard
-            graphql_url = f"{NHOST_BACKEND_URL}/v1/graphql"
-        
-        app.logger.info(f"GraphQL URL: {graphql_url}")
-        
-        # Build mutation object matching Nhost table structure
-        # Table: pdf_embeddings
-        # Columns: id (auto), created_at (auto), job_id, user_id, file_url, pdf_jpg, metadata, 
-        #          text_content, text_by_page, text_chunks, chunk_count, tables, 
-        #          status, nhost_embedding_id (optional), upload_device
-        mutation_object = {
+        app.logger.info(f"Created {len(chunks)} chunks for job {job_id}")
+
+        # Resolve title
+        metadata = data.get("metadata", {}).copy()
+        title = metadata.get("title", "").strip()
+        if not title:
+            title = _infer_title_from_first_page(text_by_page) or filename
+        num_pages = metadata.get("num_pages") or metadata.get("page_count")
+
+        # ------------------------------------------------------------------
+        # 4. INSERT tt_ai.documents
+        # ------------------------------------------------------------------
+        _progress("insert_document", 15, "Inserting document record…")
+
+        doc_object = {
             "job_id": job_id,
-            "metadata": payload['metadata'],
-            "text_content": combined_text,  # Full text for reference
-            "text_by_page": payload['text_by_page'],  # Page-by-page text
-            "text_chunks": chunks,  # Chunked text for embeddings (important for large PDFs)
-            "chunk_count": len(chunks),  # Number of chunks created
-            "tables": payload['tables'],
-            "status": "ready_for_embedding",
-            "file_url": file_url,  # Can be set if file is stored in S3/storage (nullable)
-            "pdf_jpg": None,  # Will be updated after JPG conversion and upload
-            "upload_device": upload_device  # Required: Device/platform from form upload
+            "title": title,
+            "filename": filename,
+            "source": source_url,
+            "preview_url": preview_url,
+            "num_pages": num_pages,
+            "metadata": metadata,
+            "status": "processing",
+            "upload_device": upload_device,
         }
-        
-        # Add user_id if provided
         if user_id:
-            mutation_object["user_id"] = user_id
-        
-        graphql_mutation = {
-            "query": """
-                mutation InsertPDFEmbedding($object: pdf_embeddings_insert_input!) {
-                    insert_pdf_embeddings_one(object: $object) {
-                        id
-                        job_id
-                        status
-                        chunk_count
-                        created_at
-                    }
+            doc_object["userID"] = user_id
+
+        insert_doc_mutation = """
+            mutation InsertDocument($obj: tt_ai_documents_insert_input!) {
+                insert_tt_ai_documents_one(object: $obj) {
+                    id
                 }
-            """,
-            "variables": {
-                "object": mutation_object
             }
-        }
-        
-        # For large PDFs, increase timeout
-        timeout = 120 if len(chunks) > 100 else 60 if len(chunks) > 50 else 30
-        
-        app.logger.info(f"Sending GraphQL mutation to Nhost (chunks: {len(chunks)}, timeout: {timeout}s)")
-        app.logger.debug(f"Mutation object keys: {list(mutation_object.keys())}")
-        app.logger.debug(f"User ID: {user_id}, Upload device: {upload_device}")
-        
-        response = requests.post(
-            graphql_url,
-            json=graphql_mutation,
-            headers=headers,
-            timeout=timeout
-        )
-        
-        app.logger.info(f"Nhost response status: {response.status_code}")
-        
-        if response.status_code == 200:
-            result = response.json()
-            app.logger.debug(f"Nhost response: {result}")
-            
-            if 'errors' in result:
-                app.logger.error(f"Nhost GraphQL errors: {result['errors']}")
-                app.logger.error(f"Full error response: {result}")
-                return None
-            
-            if 'data' in result and result.get('data', {}).get('insert_pdf_embeddings_one'):
-                pdf_embedding_id = result['data']['insert_pdf_embeddings_one'].get('id')
-                app.logger.info(f"Successfully sent data to Nhost for job {job_id}")
-                app.logger.info(f"Inserted record ID: {pdf_embedding_id}")
-                
-                # Create subscriber entry if user_id is provided
-                if user_id and pdf_embedding_id:
-                    subscriber_result = _create_subscriber_entry(pdf_embedding_id, user_id, graphql_url, headers)
-                    if subscriber_result:
-                        app.logger.info(f"Created subscriber entry for user {user_id} and embedding {pdf_embedding_id}")
-                    else:
-                        app.logger.warning(f"Failed to create subscriber entry for user {user_id} and embedding {pdf_embedding_id}")
-                
-                # Upload PDF to DigitalOcean Spaces after successful embedding creation
-                spaces_url = None
-                jpg_url = None
-                if file_path and pdf_embedding_id:
-                    app.logger.info(f"Checking file for Spaces upload: {file_path}, exists: {os.path.exists(file_path) if file_path else False}")
-                    if os.path.exists(file_path):
-                        file_size = os.path.getsize(file_path)
-                        app.logger.info(f"Uploading PDF to Spaces for embedding {pdf_embedding_id}, file: {file_path} (size: {file_size} bytes)")
-                        spaces_url = upload_to_spaces(file_path, filename, pdf_embedding_id, content_type='application/pdf')
-                        
-                        # Update file_url in database if upload was successful
-                        if spaces_url:
-                            app.logger.info(f"Spaces upload successful, updating database with URL: {spaces_url}")
-                            _update_file_url(pdf_embedding_id, spaces_url, graphql_url, headers)
-                            
-                            # Convert first page to JPG and upload
-                            app.logger.info(f"Converting first page of PDF to JPG for embedding {pdf_embedding_id}")
-                            jpg_path = convert_pdf_first_page_to_jpg(file_path)
-                            
-                            if jpg_path and os.path.exists(jpg_path):
-                                # Generate JPG filename
-                                jpg_filename = os.path.splitext(secure_filename(filename))[0] + "_preview.jpg"
-                                app.logger.info(f"Uploading JPG preview to Spaces: {jpg_path}")
-                                jpg_url = upload_to_spaces(jpg_path, jpg_filename, pdf_embedding_id, content_type='image/jpeg')
-                                
-                                if jpg_url:
-                                    app.logger.info(f"JPG upload successful, updating database with URL: {jpg_url}")
-                                    _update_pdf_jpg(pdf_embedding_id, jpg_url, graphql_url, headers)
-                                    
-                                    # Clean up temporary JPG file
-                                    try:
-                                        os.remove(jpg_path)
-                                        app.logger.debug(f"Cleaned up temporary JPG file: {jpg_path}")
-                                    except Exception as cleanup_error:
-                                        app.logger.warning(f"Failed to clean up JPG file {jpg_path}: {str(cleanup_error)}")
-                                else:
-                                    app.logger.warning(f"JPG upload failed for embedding {pdf_embedding_id}")
-                            else:
-                                app.logger.warning(f"PDF to JPG conversion failed for embedding {pdf_embedding_id}")
-                        else:
-                            app.logger.warning(f"Spaces upload failed for embedding {pdf_embedding_id}")
-                    else:
-                        app.logger.warning(f"File does not exist at path: {file_path}, skipping Spaces upload")
-                elif not file_path:
-                    app.logger.debug("file_path not provided, skipping Spaces upload")
-                elif not pdf_embedding_id:
-                    app.logger.warning("pdf_embedding_id not available, skipping Spaces upload")
-                
-                # Send email notification after successful embedding creation
-                if user_id:
-                    _send_email_notification(filename, user_id, user_display_name, pdf_embedding_id)
-                
-                return result.get('data', {})
-            else:
-                app.logger.warning(f"Unexpected response structure: {result}")
-                return None
-        else:
-            app.logger.error(f"Nhost request failed: {response.status_code} - {graphql_url}")
-            app.logger.error(f"Response text: {response.text}")
-            try:
-                error_json = response.json()
-                app.logger.error(f"Error JSON: {error_json}")
-            except:
-                pass
+        """
+        doc_result = _gql(graphql_url, gql_headers, insert_doc_mutation,
+                          {"obj": doc_object}, timeout=30)
+
+        if "errors" in doc_result:
+            app.logger.error(f"GraphQL error inserting document: {doc_result['errors']}")
             return None
-            
-    except Exception as e:
-        app.logger.error(f"Error sending to Nhost: {str(e)}")
-        return None
 
+        document_id = doc_result["data"]["insert_tt_ai_documents_one"]["id"]
+        app.logger.info(f"Inserted document {document_id} for job {job_id}")
 
-def _create_subscriber_entry(pdf_embedding_id, user_id, graphql_url, headers):
-    """
-    Create a subscriber entry in pdf_embeddings_subscribers table.
-    
-    Args:
-        pdf_embedding_id: UUID of the pdf_embeddings record
-        user_id: UUID of the user
-        graphql_url: Nhost GraphQL endpoint URL
-        headers: Request headers with admin secret
-    
-    Returns:
-        Dictionary with subscriber data if successful, None otherwise
-    """
-    try:
-        mutation_object = {
-            "user_id": user_id,  # Note: using user_ID as per table structure
-            "pdf_embedding_id": pdf_embedding_id,
-            "useCount": 0
-        }
-        
-        graphql_mutation = {
-            "query": """
-                mutation InsertPDFEmbeddingSubscriber($object: pdf_embeddings_subscribers_insert_input!) {
-                    insert_pdf_embeddings_subscribers_one(object: $object) {
-                        id
-                        user_id
-                        pdf_embedding_id
-                        useCount
-                        created_at
-                    }
+        # ------------------------------------------------------------------
+        # 5. Bulk INSERT tt_ai.chunks (no embeddings yet)
+        # ------------------------------------------------------------------
+        _progress("insert_chunks", 25, f"Inserting {len(chunks)} chunks…")
+
+        chunk_objects = []
+        for ch in chunks:
+            pages_list = ch.get("pages", [])
+            printed_pages = ch.get("printed_pages", [])
+            chapters_list = ch.get("chapters", [])
+            chunk_objects.append({
+                "document_id": document_id,
+                "chunk_index": ch["chunk_index"],
+                "content": ch["text"],
+                "page": pages_list[0] if pages_list else None,
+                "printed_page": printed_pages[0] if printed_pages else None,
+                "chapter": chapters_list[0] if chapters_list else None,
+                "char_count": ch.get("char_count", len(ch["text"])),
+            })
+
+        insert_chunks_mutation = """
+            mutation InsertChunks($objects: [tt_ai_chunks_insert_input!]!) {
+                insert_tt_ai_chunks(objects: $objects) {
+                    returning { id chunk_index }
                 }
-            """,
-            "variables": {
-                "object": mutation_object
             }
-        }
-        
-        app.logger.info(f"Creating subscriber entry for embedding {pdf_embedding_id} and user {user_id}")
-        
-        response = requests.post(
-            graphql_url,
-            json=graphql_mutation,
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            
-            if 'errors' in result:
-                app.logger.error(f"GraphQL errors creating subscriber: {result['errors']}")
-                return None
-            
-            if 'data' in result and result.get('data', {}).get('insert_pdf_embeddings_subscribers_one'):
-                subscriber_data = result['data']['insert_pdf_embeddings_subscribers_one']
-                app.logger.info(f"Successfully created subscriber entry: {subscriber_data.get('id')}")
-                return subscriber_data
-            else:
-                app.logger.warning(f"Unexpected subscriber response structure: {result}")
-                return None
-        else:
-            app.logger.error(f"Failed to create subscriber entry: {response.status_code} - {response.text}")
+        """
+        # For large PDFs, raise timeout proportionally
+        chunks_timeout = max(60, len(chunk_objects) // 10)
+        chunks_result = _gql(graphql_url, gql_headers, insert_chunks_mutation,
+                             {"objects": chunk_objects}, timeout=chunks_timeout)
+
+        if "errors" in chunks_result:
+            app.logger.error(f"GraphQL error inserting chunks: {chunks_result['errors']}")
+            # Mark document failed and bail
+            _gql(graphql_url, gql_headers,
+                 "mutation U($id:uuid!){update_tt_ai_documents_by_pk(pk_columns:{id:$id},_set:{status:\"failed\"}){id}}",
+                 {"id": document_id})
             return None
-            
-    except Exception as e:
-        app.logger.error(f"Error creating subscriber entry: {str(e)}")
+
+        inserted_chunks = chunks_result["data"]["insert_tt_ai_chunks"]["returning"]
+        # Build index → DB id map
+        chunk_id_map = {row["chunk_index"]: row["id"] for row in inserted_chunks}
+        app.logger.info(f"Inserted {len(inserted_chunks)} chunks for document {document_id}")
+
+        # ------------------------------------------------------------------
+        # 6. Generate OpenAI embeddings
+        # ------------------------------------------------------------------
+        _progress("embeddings", 40, "Generating ChatGPT embeddings…")
+
+        texts_for_embed = [ch["text"] for ch in chunks]
+        embeddings = _generate_openai_embeddings(texts_for_embed)
+
+        # ------------------------------------------------------------------
+        # 7. Update chunks with embedding vectors (one mutation per chunk)
+        #    We use a single bulk mutation via aliases to keep round-trips low.
+        # ------------------------------------------------------------------
+        if embeddings and any(e is not None for e in embeddings):
+            _progress("store_embeddings", 60, "Storing embeddings in DB…")
+
+            update_mutation_parts = []
+            update_vars = {"model": OPENAI_EMBEDDING_MODEL}
+
+            for idx, (ch, emb) in enumerate(zip(chunks, embeddings)):
+                if emb is None:
+                    continue
+                chunk_db_id = chunk_id_map.get(ch["chunk_index"])
+                if chunk_db_id is None:
+                    continue
+                alias = f"u{idx}"
+                update_mutation_parts.append(
+                    f'{alias}: update_tt_ai_chunks_by_pk('
+                    f'  pk_columns: {{id: $id_{idx}}},'
+                    f'  _set: {{embedding_chatgpt: $emb_{idx}, chatgpt_model_name: $model}}'
+                    f') {{ id }}'
+                )
+                update_vars[f"id_{idx}"] = chunk_db_id
+                update_vars[f"emb_{idx}"] = emb
+
+            if update_mutation_parts:
+                # Build dynamic variable declarations
+                var_decls = ["$model: String!"]
+                for idx, (ch, emb) in enumerate(zip(chunks, embeddings)):
+                    if emb is None:
+                        continue
+                    if chunk_id_map.get(ch["chunk_index"]) is None:
+                        continue
+                    var_decls.append(f"$id_{idx}: uuid!")
+                    var_decls.append(f"$emb_{idx}: vector!")
+
+                bulk_update_mutation = (
+                    "mutation UpdateEmbeddings(" + ", ".join(var_decls) + ") {\n"
+                    + "\n".join(update_mutation_parts)
+                    + "\n}"
+                )
+                embed_timeout = max(60, len(update_mutation_parts) // 5)
+                emb_result = _gql(graphql_url, gql_headers, bulk_update_mutation,
+                                  update_vars, timeout=embed_timeout)
+                if "errors" in emb_result:
+                    app.logger.warning(f"Partial embedding update errors: {emb_result['errors']}")
+                else:
+                    app.logger.info(
+                        f"Stored embeddings for {len(update_mutation_parts)} chunks "
+                        f"(model={OPENAI_EMBEDDING_MODEL})"
+                    )
+        else:
+            app.logger.warning("No embeddings generated – chunks stored without vectors")
+
+        # ------------------------------------------------------------------
+        # 8. Mark document as embedded
+        # ------------------------------------------------------------------
+        _progress("finalise", 90, "Finalising document record…")
+        _gql(
+            graphql_url, gql_headers,
+            """mutation MarkEmbedded($id: uuid!, $source: String, $preview: String) {
+                update_tt_ai_documents_by_pk(
+                    pk_columns: {id: $id},
+                    _set: {status: "embedded", source: $source, preview_url: $preview}
+                ) { id status }
+            }""",
+            {"id": document_id, "source": source_url, "preview": preview_url},
+            timeout=30,
+        )
+
+        # ------------------------------------------------------------------
+        # 9. Email notification
+        # ------------------------------------------------------------------
+        if user_id:
+            _send_email_notification(filename, user_id, user_display_name, document_id)
+
+        return {"document_id": document_id, "chunk_count": len(inserted_chunks)}
+
+    except Exception as exc:
+        app.logger.error(f"_send_to_db failed for job {job_id}: {exc}", exc_info=True)
         return None
-
-
-def _update_file_url(pdf_embedding_id, file_url, graphql_url, headers):
-    """
-    Update the file_url field in pdf_embeddings table after successful Spaces upload.
-    
-    Args:
-        pdf_embedding_id: UUID of the pdf_embeddings record
-        file_url: URL of the file in Spaces
-        graphql_url: Nhost GraphQL endpoint URL
-        headers: Request headers with admin secret
-    """
-    try:
-        mutation = {
-            "query": """
-                mutation UpdatePDFEmbeddingFileUrl($id: uuid!, $file_url: String!) {
-                    update_pdf_embeddings_by_pk(pk_columns: {id: $id}, _set: {file_url: $file_url}) {
-                        id
-                        file_url
-                    }
-                }
-            """,
-            "variables": {
-                "id": pdf_embedding_id,
-                "file_url": file_url
-            }
-        }
-        
-        response = requests.post(
-            graphql_url,
-            json=mutation,
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if 'errors' not in result:
-                app.logger.info(f"Updated file_url for embedding {pdf_embedding_id}")
-            else:
-                app.logger.warning(f"Error updating file_url: {result.get('errors')}")
-        else:
-            app.logger.warning(f"Failed to update file_url: {response.status_code}")
-            
-    except Exception as e:
-        app.logger.error(f"Error updating file_url: {str(e)}")
-
-
-def _update_pdf_jpg(pdf_embedding_id, pdf_jpg_url, graphql_url, headers):
-    """
-    Update the pdf_jpg field in pdf_embeddings table after successful JPG upload.
-    
-    Args:
-        pdf_embedding_id: UUID of the pdf_embeddings record
-        pdf_jpg_url: URL of the JPG file in Spaces
-        graphql_url: Nhost GraphQL endpoint URL
-        headers: Request headers with admin secret
-    """
-    try:
-        mutation = {
-            "query": """
-                mutation UpdatePDFEmbeddingJpg($id: uuid!, $pdf_jpg: String!) {
-                    update_pdf_embeddings_by_pk(pk_columns: {id: $id}, _set: {pdf_jpg: $pdf_jpg}) {
-                        id
-                        pdf_jpg
-                    }
-                }
-            """,
-            "variables": {
-                "id": pdf_embedding_id,
-                "pdf_jpg": pdf_jpg_url
-            }
-        }
-        
-        response = requests.post(
-            graphql_url,
-            json=mutation,
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if 'errors' not in result:
-                app.logger.info(f"Updated pdf_jpg for embedding {pdf_embedding_id}")
-            else:
-                app.logger.warning(f"Error updating pdf_jpg: {result.get('errors')}")
-        else:
-            app.logger.warning(f"Failed to update pdf_jpg: {response.status_code}")
-            
-    except Exception as e:
-        app.logger.error(f"Error updating pdf_jpg: {str(e)}")
 
 
 def _send_email_notification(filename, user_id, user_display_name=None, pdf_embedding_id=None):
@@ -1482,13 +1439,14 @@ def _send_webhook(job_id, status, data=None, error=None):
         app.logger.error(f"Error sending webhook: {str(e)}")
 
 
-def _process_extraction_async(file_path, original_filename, job_id, extract_type='all', pages=None, 
-                              include_tables=True, send_to_nhost=True, 
+def _process_extraction_async(file_path, original_filename, job_id, extract_type='all', pages=None,
+                              include_tables=True, send_to_nhost=True,
                               send_webhook=True, user_id=None, file_url=None, upload_device="web", user_display_name=None):
     """
     Process PDF extraction asynchronously.
     Optimized for large PDFs (800+ pages) with progress updates.
-    
+    Holds a concurrency slot for the duration of processing and releases it on completion.
+
     Args:
         file_path: Path to saved file
         original_filename: Original filename
@@ -1502,13 +1460,14 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
         file_url: Optional URL if file is stored in S3/storage
         upload_device: Device/platform used for upload (default: 'web')
     """
+    global _active_job_count
     _set_job(job_id, {
-        'status': 'processing', 
+        'status': 'processing',
         'progress': 0,
         'stage': 'file_received',
         'message': 'File received, starting extraction...'
     })
-    
+
     try:
         # Update: Reading file
         _set_job(job_id, {
@@ -1517,7 +1476,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             'stage': 'reading',
             'message': 'Reading PDF file...'
         })
-        
+
         # Verify file still exists before processing
         if not os.path.exists(file_path):
             error_msg = f"File does not exist at path: {file_path}"
@@ -1526,9 +1485,9 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             if send_webhook:
                 _send_webhook(job_id, 'failed', error=error_msg)
             return
-        
+
         app.logger.info(f"Processing PDF from path: {file_path} (exists: {os.path.exists(file_path)}, size: {os.path.getsize(file_path)} bytes)")
-        
+
         # Validate PDF structure (security check)
         is_valid, error_msg, warnings = validate_pdf_structure(file_path)
         if not is_valid:
@@ -1537,23 +1496,23 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             if send_webhook:
                 _send_webhook(job_id, 'failed', error=error_msg)
             return
-        
+
         # Log warnings if any
         if warnings:
             for warning in warnings:
                 app.logger.warning(f"PDF security warning: {warning}")
-        
+
         # Process extraction using file path with progress updates
         result, filename = _process_pdf_extraction_from_path(
             file_path, original_filename, extract_type, pages, include_tables, None, job_id
         )
-        
+
         # Verify file still exists after extraction (before Spaces upload)
         if not os.path.exists(file_path):
             app.logger.warning(f"File was deleted during extraction: {file_path}")
         else:
             app.logger.info(f"File still exists after extraction: {file_path} (size: {os.path.getsize(file_path)} bytes)")
-        
+
         if result is None:
             _set_job(job_id, {'status': 'failed', 'error': filename, 'stage': 'failed'}, ttl=REDIS_JOB_TTL_FAILED)
             if send_webhook:
@@ -1566,7 +1525,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
                 except Exception:
                     pass
             return
-        
+
         # Update: Completed reading
         _set_job(job_id, {
             'status': 'processing',
@@ -1574,39 +1533,69 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             'stage': 'reading_complete',
             'message': 'Completed reading PDF, extracting data...'
         })
-        
-        # Send to Nhost if enabled
-        nhost_result = None
+
+        # Persist to DB, generate embeddings, upload to Spaces
+        db_result = None
         if send_to_nhost:
+            # Progress callback so the job status reflects each sub-stage
+            stage_to_pct = {
+                "spaces_upload":   55,
+                "insert_document": 65,
+                "insert_chunks":   70,
+                "embeddings":      75,
+                "store_embeddings": 88,
+                "finalise":        95,
+            }
+            stage_labels = {
+                "spaces_upload":    "Uploading PDF to cloud storage…",
+                "insert_document":  "Saving document record…",
+                "insert_chunks":    "Saving text chunks…",
+                "embeddings":       "Generating ChatGPT embeddings…",
+                "store_embeddings": "Storing embeddings in database…",
+                "finalise":         "Finalising…",
+            }
+
+            def _progress_cb(stage, _pct, msg):
+                _set_job(job_id, {
+                    'status': 'processing',
+                    'progress': stage_to_pct.get(stage, 70),
+                    'stage': stage,
+                    'message': stage_labels.get(stage, msg),
+                })
+
             _set_job(job_id, {
                 'status': 'processing',
-                'progress': 60,
-                'stage': 'sending_to_db',
-                'message': 'Chunking text for embeddings...'
+                'progress': 52,
+                'stage': 'storing',
+                'message': 'Storing extracted data and generating embeddings…',
             })
-            app.logger.info(f"Calling _send_to_nhost for job {job_id}, user_id: {user_id}, upload_device: {upload_device}")
-            # user_display_name is already passed as a parameter to this function
-            nhost_result = _send_to_nhost(result, job_id, filename, user_id, None, file_url=file_url, upload_device=upload_device, file_path=file_path, user_display_name=user_display_name)
-            if nhost_result is None:
-                app.logger.warning(f"Failed to send data to Nhost for job {job_id}")
+            db_result = _send_to_db(
+                result, job_id, filename,
+                user_id=user_id,
+                file_url=file_url,
+                upload_device=upload_device,
+                file_path=file_path,
+                user_display_name=user_display_name,
+                progress_cb=_progress_cb,
+            )
+            if db_result is None:
+                app.logger.warning(f"_send_to_db returned None for job {job_id}")
             else:
-                app.logger.info(f"Successfully sent to Nhost for job {job_id}: {nhost_result}")
-            _set_job(job_id, {
-                'status': 'processing',
-                'progress': 90,
-                'stage': 'sending_to_db',
-                'message': 'Data sent to database successfully'
-            })
-        
-        # Clean up temporary file after all processing is complete (including Spaces upload)
+                app.logger.info(
+                    f"DB storage complete for job {job_id}: "
+                    f"document_id={db_result.get('document_id')}, "
+                    f"chunks={db_result.get('chunk_count')}"
+                )
+
+        # Clean up temporary file (Spaces upload already done inside _send_to_db)
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
                 app.logger.debug(f"Cleaned up temporary file: {file_path}")
             except Exception as e:
                 app.logger.warning(f"Failed to clean up temporary file {file_path}: {str(e)}")
-        
-        # Update job status - Done (completed jobs expire after 1 hour)
+
+        # Update job status – Done
         _set_job(job_id, {
             'status': 'completed',
             'progress': 100,
@@ -1614,22 +1603,30 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             'message': 'Processing complete!',
             'filename': filename,
             'data': result,
-            'nhost_result': nhost_result
+            'db_result': db_result,
         }, ttl=REDIS_JOB_TTL_COMPLETED)
-        
+
         # Send webhook
         if send_webhook:
             _send_webhook(job_id, 'completed', data={
                 'filename': filename,
                 'extraction': result,
-                'nhost_success': nhost_result is not None
+                'db_success': db_result is not None,
+                'document_id': db_result.get('document_id') if db_result else None,
             })
-            
+
     except Exception as e:
         error_msg = str(e)
         _set_job(job_id, {'status': 'failed', 'error': error_msg, 'stage': 'failed'}, ttl=REDIS_JOB_TTL_FAILED)
         if send_webhook:
             _send_webhook(job_id, 'failed', error=error_msg)
+
+    finally:
+        # Always release the concurrency slot, regardless of success or failure
+        _concurrency_semaphore.release()
+        with _active_job_lock:
+            _active_job_count -= 1
+        app.logger.info(f"Job {job_id} released concurrency slot. Active jobs: {_active_job_count}")
 
 
 def _process_pdf_extraction(file, extract_type='all', pages=None, include_tables=True):
@@ -1766,10 +1763,15 @@ def index():
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
+    with _active_job_lock:
+        active = _active_job_count
     health_status = {
         'status': 'healthy',
         'service': 'PDF Extractor API',
-        'redis': 'connected' if redis_client and redis_client.ping() else 'disconnected'
+        'redis': 'connected' if redis_client and redis_client.ping() else 'disconnected',
+        'active_jobs': active,
+        'max_concurrent_jobs': MAX_CONCURRENT_JOBS,
+        'slots_available': MAX_CONCURRENT_JOBS - active,
     }
     return jsonify(health_status)
 
@@ -1794,7 +1796,9 @@ def debug_nhost():
         'webhook_url_set': bool(WEBHOOK_URL),
         'webhook_url': WEBHOOK_URL if WEBHOOK_URL else None,
         'graphql_url_being_used': graphql_url,
-        'table_name': 'pdf_embeddings',
+        'tables': 'tt_ai.documents, tt_ai.chunks',
+        'embedding_model': OPENAI_EMBEDDING_MODEL,
+        'openai_configured': bool(OPENAI_API_KEY),
         'note': 'If getting 404, check your Nhost dashboard → Settings → API for the correct GraphQL endpoint URL and set NHOST_GRAPHQL_URL'
     }
     return jsonify(config)
@@ -1833,7 +1837,7 @@ def extract_pdf():
                 "text": {...},
                 "tables": {...}
             },
-            "nhost_result": {...}  // Only if send_to_nhost=true
+            "db_result": {...}  // Only if send_to_nhost=true
         }
     
     Status Codes:
@@ -1867,25 +1871,32 @@ def extract_pdf():
         if result is None:
             return jsonify({'error': filename}), 400  # filename contains error message
         
-        # Optionally send to Nhost
-        nhost_result = None
+        # Optionally persist to DB + generate embeddings
+        db_result = None
         if send_to_nhost:
             job_id = str(uuid.uuid4())
-            user_id = request.form.get('user_id')
+            user_id = request.form.get('userId') or request.form.get('user_id')
             file_url = request.form.get('file_url')
             upload_device = request.form.get('upload_device', 'web')
             user_display_name = request.form.get('user_display_name')
-            # Synchronous endpoint doesn't save file to disk, so file_path is None
-            nhost_result = _send_to_nhost(result, job_id, filename, user_id, jobs, file_url=file_url, upload_device=upload_device, file_path=None, user_display_name=user_display_name)
-        
+            # Synchronous endpoint has no local file path for Spaces upload
+            db_result = _send_to_db(
+                result, job_id, filename,
+                user_id=user_id,
+                file_url=file_url,
+                upload_device=upload_device,
+                file_path=None,
+                user_display_name=user_display_name,
+            )
+
         response = {
             'success': True,
             'filename': filename,
-            'data': result
+            'data': result,
         }
-        
-        if nhost_result:
-            response['nhost_result'] = nhost_result
+
+        if db_result:
+            response['db_result'] = db_result
         
         return jsonify(response)
                 
@@ -1942,91 +1953,121 @@ def extract_pdf_async():
         400: Bad request (no file, invalid parameters)
         500: Server error
     """
+    global _active_job_count
+
+    # -----------------------------------------------------------------------
+    # Concurrency gate: reject immediately if all slots are taken
+    # -----------------------------------------------------------------------
+    slot_acquired = _concurrency_semaphore.acquire(blocking=False)
+    if not slot_acquired:
+        with _active_job_lock:
+            active = _active_job_count
+        return jsonify({
+            'success': False,
+            'error': 'Busy – try again later',
+            'active_jobs': active,
+            'max_concurrent_jobs': MAX_CONCURRENT_JOBS,
+        }), 503
+
+    # We now hold a slot; increment the counter
+    with _active_job_lock:
+        _active_job_count += 1
+
     try:
         # Check if file is present
         if 'file' not in request.files:
+            _concurrency_semaphore.release()
+            with _active_job_lock:
+                _active_job_count -= 1
             return jsonify({'error': 'No file provided'}), 400
-        
+
         file = request.files['file']
-        
+
         # Get extraction options
         extract_type = request.form.get('extract_type', 'all').lower()
         pages_param = request.form.get('pages', '')
         include_tables = request.form.get('include_tables', 'true').lower() == 'true'
         send_to_nhost = request.form.get('send_to_nhost', 'true').lower() == 'true'
         send_webhook = request.form.get('send_webhook', 'true').lower() == 'true'
-        user_id = request.form.get('user_id')
-        file_url = request.form.get('file_url')  # Optional: URL if file is in S3/storage
-        upload_device = request.form.get('upload_device', 'web')  # Required: Device/platform from form upload
-        user_display_name = request.form.get('user_display_name')  # Optional: User display name for email notifications
-        
+        # Accept both camelCase 'userId' (preferred) and snake_case 'user_id' (legacy)
+        user_id = request.form.get('userId') or request.form.get('user_id')
+        file_url = request.form.get('file_url')
+        upload_device = request.form.get('upload_device', 'web')
+        user_display_name = request.form.get('user_display_name')
+
         # Parse page numbers
         pages = None
         if pages_param:
             try:
                 pages = [int(p.strip()) - 1 for p in pages_param.split(',')]
             except ValueError:
+                _concurrency_semaphore.release()
+                with _active_job_lock:
+                    _active_job_count -= 1
                 return jsonify({'error': 'Invalid page numbers format'}), 400
-        
+
         # Generate job ID
         job_id = str(uuid.uuid4())
-        
+
         # Save file to disk before starting async thread (file object closes when request ends)
         filename = secure_filename(file.filename)
         temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_{filename}")
-        
+
         try:
             file.save(temp_path)
-            # Verify file was saved
             if os.path.exists(temp_path):
                 file_size = os.path.getsize(temp_path)
                 app.logger.info(f"File saved successfully: {temp_path} (size: {file_size} bytes)")
             else:
                 app.logger.error(f"File save failed - file does not exist: {temp_path}")
-                return jsonify({
-                    'success': False,
-                    'error': 'Failed to save file to disk'
-                }), 500
+                _concurrency_semaphore.release()
+                with _active_job_lock:
+                    _active_job_count -= 1
+                return jsonify({'success': False, 'error': 'Failed to save file to disk'}), 500
         except Exception as e:
             app.logger.error(f"Error saving file: {str(e)}")
-            return jsonify({
-                'success': False,
-                'error': f'Failed to save file: {str(e)}'
-            }), 500
-        
+            _concurrency_semaphore.release()
+            with _active_job_lock:
+                _active_job_count -= 1
+            return jsonify({'success': False, 'error': f'Failed to save file: {str(e)}'}), 500
+
         # Validate PDF file (basic validation)
         is_valid, error_msg = validate_pdf_file(temp_path)
         if not is_valid:
-            # Clean up file
             try:
                 os.remove(temp_path)
-            except:
+            except Exception:
                 pass
-            return jsonify({
-                'success': False,
-                'error': error_msg
-            }), 400
-        
-        # Start async processing with file path instead of file object
+            _concurrency_semaphore.release()
+            with _active_job_lock:
+                _active_job_count -= 1
+            return jsonify({'success': False, 'error': error_msg}), 400
+
+        # Start async processing — the thread owns the semaphore slot and will release it
+        app.logger.info(f"Starting async job {job_id}. Active jobs: {_active_job_count}/{MAX_CONCURRENT_JOBS}")
         thread = threading.Thread(
             target=_process_extraction_async,
-            args=(temp_path, filename, job_id, extract_type, pages, include_tables, send_to_nhost, send_webhook, user_id, file_url, upload_device, user_display_name)
+            args=(temp_path, filename, job_id, extract_type, pages, include_tables,
+                  send_to_nhost, send_webhook, user_id, file_url, upload_device, user_display_name)
         )
         thread.daemon = True
         thread.start()
-        
+
         return jsonify({
             'success': True,
             'job_id': job_id,
             'status': 'processing',
-            'message': 'Extraction started. Use /job/<job_id> to check status.'
+            'message': 'Extraction started. Use /job/<job_id> to check status.',
+            'active_jobs': _active_job_count,
+            'max_concurrent_jobs': MAX_CONCURRENT_JOBS,
         }), 202
-                
+
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        # If we reach here without having handed off the slot to the thread, release it
+        _concurrency_semaphore.release()
+        with _active_job_lock:
+            _active_job_count -= 1
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/job/<job_id>', methods=['GET'])
@@ -2069,7 +2110,7 @@ def get_job_status(job_id):
             "message": "Processing complete!",
             "filename": "manual.pdf",
             "data": {...},
-            "nhost_result": {...}
+            "db_result": {"document_id": "uuid", "chunk_count": 42}
         }
         
         Failed:
@@ -2102,7 +2143,7 @@ def get_job_status(job_id):
         response['message'] = job.get('message', 'Processing complete!')
         response['filename'] = job.get('filename')
         response['data'] = job.get('data')
-        response['nhost_result'] = job.get('nhost_result')
+        response['db_result'] = job.get('db_result')
     elif job['status'] == 'failed':
         response['error'] = job.get('error')
         response['stage'] = job.get('stage', 'failed')
