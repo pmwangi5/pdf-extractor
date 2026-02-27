@@ -20,6 +20,7 @@ License: Open Source
 import os
 import re
 import json
+import datetime
 import tempfile
 import threading
 import uuid
@@ -382,43 +383,174 @@ def sanitize_text_for_embeddings(text):
 
 def detect_dangerous_content(text):
     """
-    Detect potentially dangerous content patterns in extracted text.
-    Uses specific patterns to avoid false positives from normal text.
-    
-    Args:
-        text: Text to analyze
-    
-    Returns:
-        Tuple of (is_dangerous: bool, reason: str)
+    Detect XSS and injection patterns in extracted text.
+    Returns (True, reason) on any match — callers must reject the document.
     """
     if not text:
         return False, None
-    
-    dangerous_patterns = [
-        # SQL injection patterns - only flag if followed by FROM/WHERE/etc (actual SQL)
-        (r'(?i)(union|select|insert|delete|drop)\s+.*?\s+(from|where|into|table)', 'Potential SQL injection'),
-        # Script injection - actual HTML script tags
-        (r'(?i)<script[^>]*>.*?</script>', 'JavaScript code detected'),
-        # Command injection - only flag actual code patterns, not common words
-        # Look for patterns like: os.system(, subprocess.call(, eval(, exec(
-        (r'(?i)(os\.system|subprocess\.(call|run|Popen)|eval\s*\(|exec\s*\(|__import__)', 'Potential command injection'),
-        # Excessive encoded content (potential obfuscation) - fixed regex syntax
-        (r'(?:%[0-9A-Fa-f]{2}){100,}', 'Excessive URL encoding (potential obfuscation)'),
-    ]
-    
-    for pattern, reason in dangerous_patterns:
+
+    for pattern, reason in _XSS_PATTERNS:
         try:
-            if re.search(pattern, text):
-                app.logger.warning(f"Dangerous content detected: {reason}")
-                # Log but don't reject (fail open) - adjust based on your security policy
-                # To reject: return True, reason
-                # To flag only: return False, reason (current behavior)
-        except re.error as e:
-            # If regex pattern is invalid, log error but don't break processing
-            app.logger.error(f"Invalid regex pattern in dangerous content detection: {pattern}, error: {str(e)}")
-            continue
-    
+            if re.search(pattern, text, re.IGNORECASE | re.DOTALL):
+                return True, reason
+        except re.error:
+            pass
+
     return False, None
+
+
+# ---------------------------------------------------------------------------
+# XSS / injection pattern set
+# Applied to both raw PDF binary (bytes decoded as latin-1) and extracted text.
+# Ordered from most specific to most general to minimise false positives.
+# ---------------------------------------------------------------------------
+_XSS_PATTERNS = [
+    # HTML script tags (any variant)
+    (r'<\s*script[\s\S]*?>', 'HTML <script> tag'),
+    (r'</\s*script\s*>', 'HTML </script> tag'),
+
+    # JavaScript event handlers on any HTML tag
+    (r'<[^>]+\s+on\w+\s*=\s*["\']?[^"\'>\s]', 'HTML event handler (onXxx=)'),
+
+    # javascript: / vbscript: URI schemes
+    (r'(?:javascript|vbscript|livescript|mocha)\s*:', 'javascript:/vbscript: URI scheme'),
+
+    # data: URIs (used to embed scripts)
+    (r'data\s*:\s*(?:text/html|application/javascript|text/javascript)', 'data: URI with executable MIME type'),
+
+    # <iframe>, <object>, <embed>, <applet> — common XSS carriers
+    (r'<\s*(?:iframe|object|embed|applet)[\s>]', 'Embedded frame/object/applet tag'),
+
+    # SVG with script or event handlers
+    (r'<\s*svg[\s\S]*?(?:onload|onerror|onclick)\s*=', 'SVG with event handler'),
+
+    # document.cookie / document.write / innerHTML / eval
+    (r'document\s*\.\s*(?:cookie|write|writeln|location|domain)', 'DOM manipulation (document.x)'),
+    (r'(?:\.innerHTML|\.outerHTML|\.insertAdjacentHTML)\s*=', 'innerHTML/outerHTML assignment'),
+    (r'\beval\s*\(', 'eval() call'),
+    (r'\bsetTimeout\s*\(\s*["\']', 'setTimeout with string argument'),
+    (r'\bsetInterval\s*\(\s*["\']', 'setInterval with string argument'),
+    (r'\bFunction\s*\(', 'Function() constructor'),
+
+    # window.location redirect
+    (r'window\s*\.\s*location\s*(?:=|\.href\s*=|\.replace\s*\()', 'window.location redirect'),
+
+    # HTML entity obfuscation of <script
+    (r'(?:&#x?0*(?:3[Cc]|60)\s*;?\s*){1,}s\s*c\s*r\s*i\s*p\s*t', 'HTML-entity-encoded <script'),
+
+    # Base64-encoded javascript:
+    (r'(?:amF2YXNjcmlwdA|amF2YXNjcmlwdDo)', 'Base64-encoded javascript:'),
+
+    # PDF-specific: /JavaScript /JS /OpenAction /AA /URI with javascript
+    # These appear in raw PDF binary
+    (r'/(?:JavaScript|JS)\s*[(<\[]', 'PDF /JavaScript action'),
+    (r'/(?:OpenAction|AA)\s*[(<\[]', 'PDF /OpenAction or /AA trigger'),
+    (r'/URI\s*\([^)]*javascript:', 'PDF /URI with javascript: scheme'),
+    (r'/Launch\s*[(<\[]', 'PDF /Launch action (arbitrary command execution)'),
+    (r'/SubmitForm\s*[(<\[]', 'PDF /SubmitForm action'),
+    (r'/ImportData\s*[(<\[]', 'PDF /ImportData action'),
+    (r'/RichMedia\s*[(<\[]', 'PDF /RichMedia (Flash) action'),
+]
+
+
+def _scan_pdf_binary_for_xss(file_path):
+    """
+    Scan the raw PDF binary for XSS/injection patterns.
+    This catches payloads in annotations, form fields, metadata, and URI actions
+    that text extraction would never surface.
+
+    Returns (True, reason) if a pattern is found, (False, None) otherwise.
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            raw = f.read()
+        # Decode as latin-1 (lossless for binary) so regex works on the full byte stream
+        text = raw.decode('latin-1', errors='replace')
+        return detect_dangerous_content(text)
+    except Exception as exc:
+        app.logger.warning(f"Could not scan PDF binary for XSS: {exc}")
+        return False, None
+
+
+def _flag_user_bad_actor(user_id, graphql_url, gql_headers, reason):
+    """
+    Hard-ban a user who uploaded a document containing XSS/injection content.
+
+    Two mutations run independently so a failure in one does not block the other:
+
+    1. auth.users (Nhost managed table):
+         disabled    = true
+         defaultRole = ""   (strips all role-based access)
+
+    2. userProfiles (app table), matched on userID:
+         canRunGFcrm    = false
+         mechanicGarageId = null
+         isAdmin        = 0
+         userMetaData   = { "BANNED": true, "reason": "...", "timestamp": "..." }
+    """
+    if not user_id:
+        return
+
+    ban_meta = {
+        "BANNED": True,
+        "reason": f"XSS/injection detected in uploaded PDF: {reason}",
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "action": "account disabled, all roles stripped",
+    }
+
+    # --- Mutation 1: disable the auth.users record ---
+    try:
+        auth_mutation = """
+            mutation BanUser($id: uuid!) {
+                updateUser(pk_columns: {id: $id}, _set: {
+                    disabled:    true,
+                    defaultRole: ""
+                }) { id disabled defaultRole }
+            }
+        """
+        auth_result = _gql(graphql_url, gql_headers, auth_mutation,
+                           {"id": user_id}, timeout=15)
+        if "errors" in auth_result:
+            app.logger.error(
+                f"[BAN] auth.users update failed for {user_id}: {auth_result['errors']}"
+            )
+        else:
+            app.logger.warning(
+                f"[BAN] auth.users: user {user_id} disabled, defaultRole cleared"
+            )
+    except Exception as exc:
+        app.logger.error(f"[BAN] auth.users mutation exception for {user_id}: {exc}")
+
+    # --- Mutation 2: strip privileges in userProfiles ---
+    try:
+        profile_mutation = """
+            mutation BanUserProfile($uid: uuid!, $meta: jsonb!) {
+                update_userProfiles(
+                    where: {userID: {_eq: $uid}},
+                    _set: {
+                        canRunGFcrm:      false,
+                        mechanicGarageId: null,
+                        isAdmin:          0,
+                        userMetaData:     $meta
+                    }
+                ) { affected_rows }
+            }
+        """
+        profile_result = _gql(graphql_url, gql_headers, profile_mutation,
+                              {"uid": user_id, "meta": ban_meta}, timeout=15)
+        if "errors" in profile_result:
+            app.logger.error(
+                f"[BAN] userProfiles update failed for {user_id}: {profile_result['errors']}"
+            )
+        else:
+            rows = profile_result.get("data", {}).get(
+                "update_userProfiles", {}
+            ).get("affected_rows", 0)
+            app.logger.warning(
+                f"[BAN] userProfiles: {rows} row(s) updated for user {user_id}"
+            )
+    except Exception as exc:
+        app.logger.error(f"[BAN] userProfiles mutation exception for {user_id}: {exc}")
 
 
 def convert_pdf_first_page_to_jpg(pdf_path, output_path=None):
@@ -860,13 +992,14 @@ def _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400):
         # Sanitize text for embeddings (remove dangerous content)
         sanitized_text = sanitize_text_for_embeddings(normalized_text)
 
-        # Detect dangerous content (log warnings only, don't block processing)
-        try:
-            is_dangerous, reason = detect_dangerous_content(sanitized_text)
-            if is_dangerous:
-                app.logger.warning(f"Dangerous content detected in page {page_num}: {reason}")
-        except Exception as e:
-            app.logger.warning(f"Error in dangerous content detection for page {page_num}: {str(e)}")
+        # XSS / injection scan on extracted text — raises on any hit so the
+        # entire document is rejected. The binary scan already ran before
+        # extraction; this is a second layer for content embedded in text streams.
+        is_dangerous, reason = detect_dangerous_content(sanitized_text)
+        if is_dangerous:
+            raise ValueError(
+                f"XSS/injection detected in extracted text on page {page_num}: {reason}"
+            )
         
         # Split into semantic units
         units = _split_into_semantic_units(sanitized_text)
@@ -996,34 +1129,87 @@ def _gql(graphql_url, headers, query, variables, timeout=30):
 def _generate_openai_embeddings(texts):
     """
     Call the OpenAI embeddings API for a list of texts.
-    Batches automatically to respect OPENAI_EMBED_BATCH_SIZE.
 
-    Returns a list of float lists (one per input text), or None on failure.
-    The returned list is always the same length as `texts`; failed batches
-    produce None entries so callers can still store the chunks without vectors.
+    - Batches to OPENAI_EMBED_BATCH_SIZE (default 200) per API call.
+    - Retries each batch up to 4 times with exponential back-off on rate-limit
+      (429) or transient server (5xx) errors.
+    - Raises RuntimeError if any batch ultimately fails after all retries, so
+      the caller always gets a complete result or a hard exception — never a
+      silent partial list with None holes.
+
+    Returns a list of PostgreSQL vector literal strings, one per input text,
+    in the same order:  ["[0.12,0.34,...]", "[0.56,0.78,...]", ...]
     """
+    import time
+
     if not OPENAI_AVAILABLE:
-        app.logger.warning("openai package not installed – skipping embeddings")
-        return None
+        raise RuntimeError("openai package not installed – add it to requirements.txt")
     if not OPENAI_API_KEY:
-        app.logger.warning("OPENAI_API_KEY not set – skipping embeddings")
-        return None
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
     client = _OpenAIClient(api_key=OPENAI_API_KEY)
     results = [None] * len(texts)
 
+    MAX_RETRIES = 4
+    BASE_BACKOFF = 2  # seconds; doubles each retry
+
     for batch_start in range(0, len(texts), OPENAI_EMBED_BATCH_SIZE):
         batch = texts[batch_start: batch_start + OPENAI_EMBED_BATCH_SIZE]
-        try:
-            resp = client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=batch)
-            for item in resp.data:
-                results[batch_start + item.index] = item.embedding
-            app.logger.debug(
-                f"Embedded batch {batch_start}–{batch_start + len(batch) - 1} "
-                f"({len(batch)} texts, model={OPENAI_EMBEDDING_MODEL})"
+        last_exc = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = client.embeddings.create(
+                    model=OPENAI_EMBEDDING_MODEL,
+                    input=batch,
+                )
+                for item in resp.data:
+                    # Store as PostgreSQL vector literal — Hasura expects a String
+                    vec = item.embedding
+                    results[batch_start + item.index] = (
+                        "[" + ",".join(str(v) for v in vec) + "]"
+                    )
+                app.logger.info(
+                    f"OpenAI embeddings: batch {batch_start}–"
+                    f"{batch_start + len(batch) - 1} OK "
+                    f"({len(batch)} texts, attempt {attempt + 1})"
+                )
+                last_exc = None
+                break  # success — move to next batch
+
+            except Exception as exc:
+                last_exc = exc
+                # Detect rate-limit or server error for back-off
+                is_retryable = (
+                    "rate" in str(exc).lower()
+                    or "429" in str(exc)
+                    or "500" in str(exc)
+                    or "503" in str(exc)
+                    or "timeout" in str(exc).lower()
+                )
+                if is_retryable and attempt < MAX_RETRIES - 1:
+                    wait = BASE_BACKOFF * (2 ** attempt)
+                    app.logger.warning(
+                        f"OpenAI batch {batch_start} attempt {attempt + 1} failed "
+                        f"({exc}), retrying in {wait}s…"
+                    )
+                    time.sleep(wait)
+                else:
+                    break
+
+        if last_exc is not None:
+            raise RuntimeError(
+                f"OpenAI embeddings failed for batch starting at index "
+                f"{batch_start} after {MAX_RETRIES} attempts: {last_exc}"
             )
-        except Exception as exc:
-            app.logger.error(f"OpenAI embeddings batch {batch_start} failed: {exc}")
+
+    # Sanity-check: every slot must be filled
+    missing = [i for i, v in enumerate(results) if v is None]
+    if missing:
+        raise RuntimeError(
+            f"OpenAI response missing embeddings for {len(missing)} texts "
+            f"(indices: {missing[:10]}{'…' if len(missing) > 10 else ''})"
+        )
 
     return results
 
@@ -1039,25 +1225,31 @@ def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
       1. Upload PDF to DigitalOcean Spaces → get CDN source URL
       2. Convert first page → JPG → upload → get preview_url
       3. INSERT tt_ai.documents  (status = 'processing')
-      4. Bulk INSERT tt_ai.chunks (no embeddings yet)
-      5. Generate OpenAI embeddings in batches
-      6. Bulk UPDATE tt_ai.chunks with embedding vectors
+      4. Generate OpenAI embeddings for all chunks (raises on any failure)
+      5. Bulk INSERT tt_ai.chunks with embeddings already set (batched, 100/call)
+      6. Verify affected_rows == len(chunks) — raises if mismatch
       7. UPDATE tt_ai.documents  (status = 'embedded')
       8. Send email notification
+
+    Failure contract:
+      - Any exception sets document status = 'failed' in the DB (best-effort)
+        and returns None.
+      - The job in Redis is marked 'failed' by the caller (_process_extraction_async).
+      - 'embedded' is only written after every chunk row is confirmed inserted.
 
     Args:
         data:               Extracted PDF data dict (keys: metadata, text, tables)
         job_id:             Unique job identifier
         filename:           Original filename
         user_id:            Optional UUID string of the uploading user
-        file_url:           Pre-existing URL (ignored if file_path is provided)
+        file_url:           Pre-existing URL (used only if file_path is absent)
         upload_device:      Device/platform label (default: 'web')
         file_path:          Local temp path of the PDF – used for Spaces upload
         user_display_name:  For email notification
         progress_cb:        Optional callable(stage: str, pct: int, msg: str)
 
     Returns:
-        dict with document_id and chunk_count on success, None on failure.
+        {'document_id': str, 'chunk_count': int} on success, None on any failure.
     """
     if not NHOST_BACKEND_URL or not NHOST_ADMIN_SECRET:
         app.logger.warning("Nhost not configured – skipping DB storage")
@@ -1110,6 +1302,14 @@ def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
         chunks = _chunk_text_for_embeddings(text_by_page, chunk_size=1500, overlap=400)
         app.logger.info(f"Created {len(chunks)} chunks for job {job_id}")
 
+        if not chunks:
+            raise RuntimeError(
+                "No text could be extracted from this PDF. "
+                "It may be a scanned image-only document with no selectable text."
+            )
+        # _chunk_text_for_embeddings raises ValueError if XSS is found in text.
+        # That is caught below in the except block, which flags the user.
+
         # Resolve title
         metadata = data.get("metadata", {}).copy()
         title = metadata.get("title", "").strip()
@@ -1154,118 +1354,104 @@ def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
         app.logger.info(f"Inserted document {document_id} for job {job_id}")
 
         # ------------------------------------------------------------------
-        # 5. Bulk INSERT tt_ai.chunks (no embeddings yet)
+        # 5. Generate OpenAI embeddings BEFORE inserting chunks.
+        #    This way we never write orphan rows to the DB if OpenAI fails.
+        #    _generate_openai_embeddings raises RuntimeError on any failure —
+        #    it never returns a partial list.
         # ------------------------------------------------------------------
-        _progress("insert_chunks", 25, f"Inserting {len(chunks)} chunks…")
+        _progress("embeddings", 30, f"Generating embeddings for {len(chunks)} chunks…")
+
+        texts_for_embed = [ch["text"] for ch in chunks]
+        # Raises RuntimeError if OpenAI is misconfigured or the API fails after retries.
+        # The exception is caught by the outer try/except which sets status='failed'.
+        embeddings = _generate_openai_embeddings(texts_for_embed)
+
+        # Hard guarantee: one vector per chunk, no None holes
+        assert len(embeddings) == len(chunks), (
+            f"Embedding count mismatch: got {len(embeddings)}, expected {len(chunks)}"
+        )
+
+        app.logger.info(
+            f"All {len(embeddings)} embeddings generated "
+            f"(model={OPENAI_EMBEDDING_MODEL})"
+        )
+
+        # ------------------------------------------------------------------
+        # 6. Bulk INSERT tt_ai.chunks with embeddings already populated.
+        #    Single round-trip, no separate UPDATE needed.
+        #    For very large PDFs (800+ pages, 800+ chunks) we batch the insert
+        #    to avoid hitting Hasura's default 30 MB request body limit.
+        # ------------------------------------------------------------------
+        _progress("insert_chunks", 55, f"Inserting {len(chunks)} chunks with embeddings…")
+
+        INSERT_BATCH = 100  # chunks per insert call — safe for large vectors
 
         chunk_objects = []
-        for ch in chunks:
-            pages_list = ch.get("pages", [])
+        for ch, vec_str in zip(chunks, embeddings):
+            pages_list    = ch.get("pages", [])
             printed_pages = ch.get("printed_pages", [])
             chapters_list = ch.get("chapters", [])
             chunk_objects.append({
-                "document_id": document_id,
-                "chunk_index": ch["chunk_index"],
-                "content": ch["text"],
-                "page": pages_list[0] if pages_list else None,
-                "printed_page": printed_pages[0] if printed_pages else None,
-                "chapter": chapters_list[0] if chapters_list else None,
-                "char_count": ch.get("char_count", len(ch["text"])),
+                "document_id":        document_id,
+                "chunk_index":        ch["chunk_index"],
+                "content":            ch["text"],
+                "page":               pages_list[0]    if pages_list    else None,
+                "printed_page":       printed_pages[0] if printed_pages else None,
+                "chapter":            chapters_list[0] if chapters_list else None,
+                "char_count":         ch.get("char_count", len(ch["text"])),
+                "embedding_chatgpt":  vec_str,
+                "chatgpt_model_name": OPENAI_EMBEDDING_MODEL,
             })
 
         insert_chunks_mutation = """
             mutation InsertChunks($objects: [tt_ai_chunks_insert_input!]!) {
                 insert_tt_ai_chunks(objects: $objects) {
-                    returning { id chunk_index }
+                    affected_rows
                 }
             }
         """
-        # For large PDFs, raise timeout proportionally
-        chunks_timeout = max(60, len(chunk_objects) // 10)
-        chunks_result = _gql(graphql_url, gql_headers, insert_chunks_mutation,
-                             {"objects": chunk_objects}, timeout=chunks_timeout)
 
-        if "errors" in chunks_result:
-            app.logger.error(f"GraphQL error inserting chunks: {chunks_result['errors']}")
-            # Mark document failed and bail
-            _gql(graphql_url, gql_headers,
-                 "mutation U($id:uuid!){update_tt_ai_documents_by_pk(pk_columns:{id:$id},_set:{status:\"failed\"}){id}}",
-                 {"id": document_id})
-            return None
-
-        inserted_chunks = chunks_result["data"]["insert_tt_ai_chunks"]["returning"]
-        # Build index → DB id map
-        chunk_id_map = {row["chunk_index"]: row["id"] for row in inserted_chunks}
-        app.logger.info(f"Inserted {len(inserted_chunks)} chunks for document {document_id}")
-
-        # ------------------------------------------------------------------
-        # 6. Generate OpenAI embeddings
-        # ------------------------------------------------------------------
-        _progress("embeddings", 40, "Generating ChatGPT embeddings…")
-
-        texts_for_embed = [ch["text"] for ch in chunks]
-        embeddings = _generate_openai_embeddings(texts_for_embed)
-
-        # ------------------------------------------------------------------
-        # 7. Update chunks with embedding vectors (one mutation per chunk)
-        #    We use a single bulk mutation via aliases to keep round-trips low.
-        # ------------------------------------------------------------------
-        if embeddings and any(e is not None for e in embeddings):
-            _progress("store_embeddings", 60, "Storing embeddings in DB…")
-
-            update_mutation_parts = []
-            update_vars = {"model": OPENAI_EMBEDDING_MODEL}
-
-            for idx, (ch, emb) in enumerate(zip(chunks, embeddings)):
-                if emb is None:
-                    continue
-                chunk_db_id = chunk_id_map.get(ch["chunk_index"])
-                if chunk_db_id is None:
-                    continue
-                alias = f"u{idx}"
-                update_mutation_parts.append(
-                    f'{alias}: update_tt_ai_chunks_by_pk('
-                    f'  pk_columns: {{id: $id_{idx}}},'
-                    f'  _set: {{embedding_chatgpt: $emb_{idx}, chatgpt_model_name: $model}}'
-                    f') {{ id }}'
+        total_inserted = 0
+        for batch_start in range(0, len(chunk_objects), INSERT_BATCH):
+            batch = chunk_objects[batch_start: batch_start + INSERT_BATCH]
+            # Timeout scales with batch size (each 1536-dim vector is ~12 KB)
+            insert_timeout = max(60, len(batch) * 2)
+            result = _gql(
+                graphql_url, gql_headers,
+                insert_chunks_mutation,
+                {"objects": batch},
+                timeout=insert_timeout,
+            )
+            if "errors" in result:
+                raise RuntimeError(
+                    f"Chunk insert batch {batch_start}–"
+                    f"{batch_start + len(batch) - 1} failed: {result['errors']}"
                 )
-                update_vars[f"id_{idx}"] = chunk_db_id
-                update_vars[f"emb_{idx}"] = emb
+            rows = result["data"]["insert_tt_ai_chunks"]["affected_rows"]
+            total_inserted += rows
+            app.logger.info(
+                f"Chunk insert batch {batch_start}–{batch_start + len(batch) - 1}: "
+                f"{rows} rows inserted (running total: {total_inserted})"
+            )
 
-            if update_mutation_parts:
-                # Build dynamic variable declarations
-                var_decls = ["$model: String!"]
-                for idx, (ch, emb) in enumerate(zip(chunks, embeddings)):
-                    if emb is None:
-                        continue
-                    if chunk_id_map.get(ch["chunk_index"]) is None:
-                        continue
-                    var_decls.append(f"$id_{idx}: uuid!")
-                    var_decls.append(f"$emb_{idx}: vector!")
+        # Final sanity check — every chunk must be in the DB with its vector
+        if total_inserted != len(chunk_objects):
+            raise RuntimeError(
+                f"Chunk insert count mismatch: inserted {total_inserted}, "
+                f"expected {len(chunk_objects)}"
+            )
 
-                bulk_update_mutation = (
-                    "mutation UpdateEmbeddings(" + ", ".join(var_decls) + ") {\n"
-                    + "\n".join(update_mutation_parts)
-                    + "\n}"
-                )
-                embed_timeout = max(60, len(update_mutation_parts) // 5)
-                emb_result = _gql(graphql_url, gql_headers, bulk_update_mutation,
-                                  update_vars, timeout=embed_timeout)
-                if "errors" in emb_result:
-                    app.logger.warning(f"Partial embedding update errors: {emb_result['errors']}")
-                else:
-                    app.logger.info(
-                        f"Stored embeddings for {len(update_mutation_parts)} chunks "
-                        f"(model={OPENAI_EMBEDDING_MODEL})"
-                    )
-        else:
-            app.logger.warning("No embeddings generated – chunks stored without vectors")
+        app.logger.info(
+            f"All {total_inserted} chunks inserted with embeddings "
+            f"for document {document_id}"
+        )
 
         # ------------------------------------------------------------------
-        # 8. Mark document as embedded
+        # 7. Mark document as embedded.
+        #    Only reached if every chunk was inserted successfully above.
         # ------------------------------------------------------------------
         _progress("finalise", 90, "Finalising document record…")
-        _gql(
+        mark_result = _gql(
             graphql_url, gql_headers,
             """mutation MarkEmbedded($id: uuid!, $source: String, $preview: String) {
                 update_tt_ai_documents_by_pk(
@@ -1276,17 +1462,54 @@ def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
             {"id": document_id, "source": source_url, "preview": preview_url},
             timeout=30,
         )
+        if "errors" in mark_result:
+            # Chunks are fine — just the status update failed. Log and continue.
+            app.logger.error(
+                f"MarkEmbedded mutation failed for {document_id}: "
+                f"{mark_result['errors']} — chunks are stored correctly"
+            )
+        else:
+            app.logger.info(f"Document {document_id} marked as embedded")
 
         # ------------------------------------------------------------------
-        # 9. Email notification
+        # 8. Email notification
         # ------------------------------------------------------------------
         if user_id:
             _send_email_notification(filename, user_id, user_display_name, document_id)
 
-        return {"document_id": document_id, "chunk_count": len(inserted_chunks)}
+        return {"document_id": document_id, "chunk_count": total_inserted}
 
     except Exception as exc:
         app.logger.error(f"_send_to_db failed for job {job_id}: {exc}", exc_info=True)
+
+        is_xss = isinstance(exc, ValueError) and "XSS" in str(exc)
+
+        try:
+            _doc_id = locals().get("document_id")
+            _gql_url = NHOST_GRAPHQL_URL or f"{NHOST_BACKEND_URL}/v1/graphql"
+            _hdrs = {
+                "Content-Type": "application/json",
+                "x-hasura-admin-secret": NHOST_ADMIN_SECRET,
+            }
+
+            # Flag user as bad actor if XSS was found in extracted text
+            if is_xss and user_id and NHOST_BACKEND_URL and NHOST_ADMIN_SECRET:
+                _flag_user_bad_actor(user_id, _gql_url, _hdrs, str(exc))
+
+            # Best-effort: mark document failed so it doesn't stay 'processing'
+            if _doc_id and NHOST_BACKEND_URL and NHOST_ADMIN_SECRET:
+                _gql(
+                    _gql_url, _hdrs,
+                    "mutation F($id:uuid!){"
+                    "update_tt_ai_documents_by_pk("
+                    "pk_columns:{id:$id},"
+                    "_set:{status:\"failed\"}"
+                    "){id}}",
+                    {"id": _doc_id},
+                    timeout=15,
+                )
+        except Exception as fb_exc:
+            app.logger.warning(f"Cleanup after _send_to_db failure: {fb_exc}")
         return None
 
 
@@ -1502,6 +1725,40 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             for warning in warnings:
                 app.logger.warning(f"PDF security warning: {warning}")
 
+        # ------------------------------------------------------------------
+        # XSS scan — raw PDF binary
+        # Scans the full file byte stream for JS actions, event handlers,
+        # script tags, and other XSS vectors before any text is extracted.
+        # ------------------------------------------------------------------
+        xss_found, xss_reason = _scan_pdf_binary_for_xss(file_path)
+        if xss_found:
+            app.logger.error(
+                f"XSS detected in PDF binary for job {job_id}: {xss_reason}"
+            )
+            _set_job(job_id, {
+                'status': 'failed',
+                'error': f'Document rejected: malicious content detected ({xss_reason})',
+                'stage': 'failed',
+            }, ttl=REDIS_JOB_TTL_FAILED)
+            if send_webhook:
+                _send_webhook(job_id, 'failed',
+                              error=f'XSS detected: {xss_reason}')
+            # Flag the user in Hasura if we have their ID
+            if user_id and NHOST_BACKEND_URL and NHOST_ADMIN_SECRET:
+                _flag_user_bad_actor(
+                    user_id,
+                    NHOST_GRAPHQL_URL or f"{NHOST_BACKEND_URL}/v1/graphql",
+                    {"Content-Type": "application/json",
+                     "x-hasura-admin-secret": NHOST_ADMIN_SECRET},
+                    xss_reason,
+                )
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+            return
+
         # Process extraction using file path with progress updates
         result, filename = _process_pdf_extraction_from_path(
             file_path, original_filename, extract_type, pages, include_tables, None, job_id
@@ -1537,22 +1794,20 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
         # Persist to DB, generate embeddings, upload to Spaces
         db_result = None
         if send_to_nhost:
-            # Progress callback so the job status reflects each sub-stage
+            # Progress callback maps _send_to_db stage keys → job progress %
             stage_to_pct = {
                 "spaces_upload":   55,
-                "insert_document": 65,
-                "insert_chunks":   70,
-                "embeddings":      75,
-                "store_embeddings": 88,
+                "insert_document": 62,
+                "embeddings":      68,
+                "insert_chunks":   85,
                 "finalise":        95,
             }
             stage_labels = {
-                "spaces_upload":    "Uploading PDF to cloud storage…",
-                "insert_document":  "Saving document record…",
-                "insert_chunks":    "Saving text chunks…",
-                "embeddings":       "Generating ChatGPT embeddings…",
-                "store_embeddings": "Storing embeddings in database…",
-                "finalise":         "Finalising…",
+                "spaces_upload":   "Uploading PDF to cloud storage…",
+                "insert_document": "Saving document record…",
+                "embeddings":      "Generating ChatGPT embeddings…",
+                "insert_chunks":   "Saving chunks with embeddings…",
+                "finalise":        "Finalising…",
             }
 
             def _progress_cb(stage, _pct, msg):
@@ -1578,14 +1833,32 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
                 user_display_name=user_display_name,
                 progress_cb=_progress_cb,
             )
+
             if db_result is None:
-                app.logger.warning(f"_send_to_db returned None for job {job_id}")
-            else:
-                app.logger.info(
-                    f"DB storage complete for job {job_id}: "
-                    f"document_id={db_result.get('document_id')}, "
-                    f"chunks={db_result.get('chunk_count')}"
-                )
+                # _send_to_db already set document status='failed' in the DB.
+                # Mark the job failed so the client sees the correct state.
+                app.logger.error(f"_send_to_db failed for job {job_id} — marking job failed")
+                _set_job(job_id, {
+                    'status': 'failed',
+                    'error': 'Database storage or embedding generation failed. Check service logs.',
+                    'stage': 'failed',
+                }, ttl=REDIS_JOB_TTL_FAILED)
+                if send_webhook:
+                    _send_webhook(job_id, 'failed',
+                                  error='DB storage or embedding failed')
+                # Temp file cleanup
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+                return  # exit thread — do NOT fall through to 'completed'
+
+            app.logger.info(
+                f"DB storage complete for job {job_id}: "
+                f"document_id={db_result.get('document_id')}, "
+                f"chunks={db_result.get('chunk_count')}"
+            )
 
         # Clean up temporary file (Spaces upload already done inside _send_to_db)
         if file_path and os.path.exists(file_path):
@@ -1595,7 +1868,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
             except Exception as e:
                 app.logger.warning(f"Failed to clean up temporary file {file_path}: {str(e)}")
 
-        # Update job status – Done
+        # Only reached when everything succeeded
         _set_job(job_id, {
             'status': 'completed',
             'progress': 100,

@@ -16,9 +16,10 @@ A detailed technical reference for the PDF Extractor service.
 8. [Cloud Storage (DigitalOcean Spaces)](#cloud-storage)
 9. [Concurrency Model](#concurrency-model)
 10. [Job State & Progress Tracking](#job-state--progress-tracking)
-11. [Environment Variables](#environment-variables)
-12. [Database Schema](#database-schema)
-13. [API Reference](#api-reference)
+11. [Failure Contract](#failure-contract)
+12. [Environment Variables](#environment-variables)
+13. [Database Schema](#database-schema)
+14. [API Reference](#api-reference)
 
 ---
 
@@ -26,12 +27,12 @@ A detailed technical reference for the PDF Extractor service.
 
 This is a Python/Flask microservice that sits between your Next.js frontend and your Nhost/Hasura database. Its job is to:
 
-1. Accept a PDF upload (from a Next.js file uploader)
+1. Accept a PDF upload from a Next.js file uploader
 2. Extract clean, structured text from every page — handling multi-column layouts, CID artifacts, and printed page numbers
 3. Split the text into overlapping semantic chunks optimised for vector search
-4. Upload the PDF and a preview JPG to DigitalOcean Spaces
-5. Insert a document record and all chunks into the Nhost PostgreSQL database
-6. Generate OpenAI embeddings for every chunk and store them inline
+4. Generate OpenAI embeddings for every chunk **before** writing anything to the database
+5. Upload the PDF and a preview JPG to DigitalOcean Spaces
+6. Insert the document record and all chunks (with embeddings already set) into Nhost in a single pass
 7. Return a `job_id` immediately so the client can poll for progress
 
 Everything after step 1 runs in a background thread. The HTTP response returns in milliseconds.
@@ -46,28 +47,29 @@ Next.js (browser)
       │  POST /extract/async
       │  FormData: file, userId, upload_device
       ▼
-┌─────────────────────────────────────────────────────┐
-│                  Flask API (api.py)                  │
-│                                                     │
-│  ┌──────────────────────────────────────────────┐   │
-│  │           Background Thread                  │   │
-│  │                                              │   │
-│  │  PDFExtractor (pdf_extractor.py)             │   │
-│  │    └─ pdfplumber  (text + tables)            │   │
-│  │    └─ PyPDF2      (metadata, validation)     │   │
-│  │                                              │   │
-│  │  _chunk_text_for_embeddings()                │   │
-│  │                                              │   │
-│  │  _send_to_db()                               │   │
-│  │    ├─ DigitalOcean Spaces  (PDF + JPG)       │   │
-│  │    ├─ Nhost GraphQL        (documents)       │   │
-│  │    ├─ Nhost GraphQL        (chunks)          │   │
-│  │    ├─ OpenAI Embeddings API                  │   │
-│  │    └─ Nhost GraphQL        (update vectors)  │   │
-│  └──────────────────────────────────────────────┘   │
-│                                                     │
-│  Redis (or in-memory)  ←→  job progress store       │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    Flask API (api.py)                    │
+│                                                         │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │              Background Thread                     │ │
+│  │                                                    │ │
+│  │  1. PDFExtractor (pdf_extractor.py)                │ │
+│  │       pdfplumber  — text + tables                  │ │
+│  │       PyPDF2      — metadata, validation           │ │
+│  │                                                    │ │
+│  │  2. _chunk_text_for_embeddings()                   │ │
+│  │                                                    │ │
+│  │  3. _send_to_db()                                  │ │
+│  │       ├─ DigitalOcean Spaces  (PDF upload)         │ │
+│  │       ├─ DigitalOcean Spaces  (JPG preview)        │ │
+│  │       ├─ Nhost GraphQL        INSERT documents     │ │
+│  │       ├─ OpenAI Embeddings API (batched, retried)  │ │
+│  │       ├─ Nhost GraphQL        INSERT chunks+vecs   │ │
+│  │       └─ Nhost GraphQL        UPDATE doc→embedded  │ │
+│  └────────────────────────────────────────────────────┘ │
+│                                                         │
+│  Redis (or in-memory)  ←→  job progress store           │
+└─────────────────────────────────────────────────────────┘
       │
       │  GET /job/<job_id>   (client polls)
       ▼
@@ -120,7 +122,7 @@ HTTP 202
 
 ### 5. Background thread runs the full pipeline
 
-The thread holds the semaphore slot for its entire duration and releases it in a `finally` block — guaranteeing the slot is freed even on crash.
+The thread holds the semaphore slot for its entire duration and releases it in a `finally` block — guaranteed even on crash or exception.
 
 ---
 
@@ -137,11 +139,74 @@ Two libraries are used together:
 
 ### Security validation
 
-Before extraction, `validate_pdf_structure()` in `api.py` checks:
+Before extraction, `validate_pdf_structure()` checks:
 - Magic bytes (`%PDF`) — rejects files with a `.pdf` extension but non-PDF content
 - File size (min 100 bytes, max 200 MB)
 - Page count (max 10,000 pages)
 - Embedded scripts or embedded files (potential malware vectors)
+
+### XSS / injection defence (two layers)
+
+#### Layer 1 — Raw binary scan (`_scan_pdf_binary_for_xss`)
+
+Runs **before** any text extraction. The entire PDF file is read as bytes and decoded as `latin-1` (lossless). The full byte stream is scanned against `_XSS_PATTERNS` — a list of 27 compiled regexes covering:
+
+- HTML `<script>` tags (any variant, including entity-encoded)
+- JavaScript event handlers (`onload=`, `onerror=`, etc.)
+- `javascript:` / `vbscript:` / `data:` URI schemes
+- `<iframe>`, `<object>`, `<embed>`, `<applet>` tags
+- SVG with event handlers
+- DOM manipulation (`document.cookie`, `innerHTML=`, `eval()`, etc.)
+- `window.location` redirects
+- Base64-encoded `javascript:`
+- PDF-specific actions: `/JavaScript`, `/JS`, `/OpenAction`, `/AA`, `/Launch`, `/SubmitForm`, `/ImportData`, `/RichMedia`
+
+If any pattern matches, the document is **rejected immediately** — the temp file is deleted, the job is marked `failed`, and `_flag_user_bad_actor()` is called.
+
+#### Layer 2 — Extracted text scan (`detect_dangerous_content`)
+
+During chunking, every page's sanitised text is scanned with the same `_XSS_PATTERNS` set. This catches payloads embedded in text streams that the binary scan might miss (e.g. obfuscated content in form field values). A match raises a `ValueError` which propagates to `_send_to_db`'s `except` block, which also calls `_flag_user_bad_actor()`.
+
+#### User ban (`_flag_user_bad_actor`)
+
+When XSS is detected, two independent Hasura mutations are executed (a failure in one does not block the other):
+
+**Mutation 1 — `auth.users` (Nhost managed table):**
+```graphql
+mutation BanUser($id: uuid!) {
+    updateUser(pk_columns: {id: $id}, _set: {
+        disabled:    true,
+        defaultRole: ""
+    }) { id disabled defaultRole }
+}
+```
+
+**Mutation 2 — `userProfiles` (app table):**
+```graphql
+mutation BanUserProfile($uid: uuid!, $meta: jsonb!) {
+    update_userProfiles(
+        where: {userID: {_eq: $uid}},
+        _set: {
+            canRunGFcrm:      false,
+            mechanicGarageId: null,
+            isAdmin:          0,
+            userMetaData:     $meta
+        }
+    ) { affected_rows }
+}
+```
+
+The `userMetaData` payload written is:
+```json
+{
+  "BANNED": true,
+  "reason": "XSS/injection detected in uploaded PDF: <pattern name>",
+  "timestamp": "2026-02-27T12:34:56.789Z",
+  "action": "account disabled, all roles stripped"
+}
+```
+
+Both mutations use the Hasura admin secret so they can write to the `auth` schema and the app schema regardless of row-level security policies.
 
 ### Per-page extraction (`_extract_page_text`)
 
@@ -175,7 +240,7 @@ Words are filtered to each column's x-range (with ±2 px tolerance for slight mi
 
 #### Step 5 — Columns joined
 
-Column texts are joined with a blank line (`\n\n`) separator, preserving the natural left-to-right reading order.
+Column texts are joined with a blank line (`\n\n`) separator, preserving natural left-to-right reading order.
 
 #### Step 6 — Cleanup
 
@@ -245,13 +310,19 @@ Chunks are capped at `MAX_CHUNKS_PER_PDF` (10,000) to prevent resource exhaustio
 
 This is the core persistence function. It runs entirely inside the background thread and updates job progress at each stage.
 
-### Stage 1 — Spaces upload (progress 5%)
+### Critical design principle: embeddings are generated BEFORE any chunk rows are written
+
+This guarantees there are no orphan chunk rows in the database without vectors. If OpenAI fails, nothing is written to `tt_ai.chunks`. The document row is marked `failed`. No partial states.
+
+### Stage 1 — Spaces upload (progress 55%)
 
 The local temp PDF is uploaded to DigitalOcean Spaces. On success:
 - The CDN URL becomes `source` in `tt_ai.documents`
 - The first page is rendered to a JPG (via `pdf2image`/`poppler`) and uploaded as `preview_url`
 
-### Stage 2 — INSERT `tt_ai.documents` (progress 15%)
+Spaces failure is non-fatal — the document is stored without a `source` URL if the upload fails.
+
+### Stage 2 — INSERT `tt_ai.documents` (progress 62%)
 
 A single GraphQL mutation inserts the document record with `status = 'processing'`:
 
@@ -263,47 +334,49 @@ mutation InsertDocument($obj: tt_ai_documents_insert_input!) {
 
 Fields written: `job_id`, `title`, `filename`, `source`, `preview_url`, `num_pages`, `metadata`, `status`, `upload_device`, `userID`.
 
-### Stage 3 — Bulk INSERT `tt_ai.chunks` (progress 25%)
+If this mutation returns GraphQL errors, the function returns `None` immediately (no document row exists to clean up). The caller marks the job `failed`.
 
-All chunks are inserted in a single GraphQL mutation. No embeddings yet — this keeps the insert fast and decouples text storage from the OpenAI API call.
+### Stage 3 — Generate OpenAI embeddings (progress 68%)
+
+See [OpenAI Embeddings](#openai-embeddings) section below.
+
+`_generate_openai_embeddings()` **raises `RuntimeError`** on any failure — it never returns a partial list. The exception propagates to the outer `except` block which sets `document.status = 'failed'`.
+
+After the call returns, an `assert len(embeddings) == len(chunks)` verifies completeness before proceeding.
+
+### Stage 4 — Bulk INSERT `tt_ai.chunks` with embeddings (progress 85%)
+
+Chunks are inserted in batches of 100, each with `embedding_chatgpt` and `chatgpt_model_name` already set. No separate UPDATE pass is needed.
 
 ```graphql
 mutation InsertChunks($objects: [tt_ai_chunks_insert_input!]!) {
   insert_tt_ai_chunks(objects: $objects) {
-    returning { id chunk_index }
+    affected_rows
   }
 }
 ```
 
-The response returns the DB-assigned `id` for every chunk, keyed by `chunk_index`.
+Each batch returns `affected_rows`. After all batches, `total_inserted` is compared to `len(chunk_objects)`. Any mismatch raises immediately — the document is never marked `embedded`.
 
-### Stage 4 — Generate embeddings (progress 40–75%)
+**Why batches of 100?**
+An 800-page PDF produces ~800 chunks. Each chunk carries a 1536-dimension vector (~12 KB as a string). 800 × 12 KB ≈ 9.6 MB — near Hasura's default request body limit. Batching at 100 keeps each payload under 1.2 MB with headroom.
 
-See [OpenAI Embeddings](#openai-embeddings) section below.
+### Stage 5 — Mark document embedded (progress 95%)
 
-### Stage 5 — Bulk UPDATE chunks with vectors (progress 60–88%)
-
-A single GraphQL mutation with N aliased `update_by_pk` fields updates all chunks in one HTTP round-trip:
+Only reached after `total_inserted == len(chunk_objects)` is confirmed:
 
 ```graphql
-mutation UpdateEmbeddings($id_0: uuid!, $emb_0: vector!, ..., $model: String!) {
-  u0: update_tt_ai_chunks_by_pk(pk_columns: {id: $id_0}, _set: {embedding_chatgpt: $emb_0, chatgpt_model_name: $model}) { id }
-  u1: update_tt_ai_chunks_by_pk(pk_columns: {id: $id_1}, _set: {embedding_chatgpt: $emb_1, chatgpt_model_name: $model}) { id }
-  ...
+mutation MarkEmbedded($id: uuid!, $source: String, $preview: String) {
+  update_tt_ai_documents_by_pk(
+    pk_columns: {id: $id},
+    _set: {status: "embedded", source: $source, preview_url: $preview}
+  ) { id status }
 }
 ```
 
-Chunks where the OpenAI call failed (network error, rate limit) are skipped — they remain in the DB without a vector and can be re-embedded later.
+If this final mutation fails (rare — chunks are already stored correctly), it is logged as an error but does not abort. The document stays at `processing` in the DB but the chunks are intact.
 
-### Stage 6 — Mark document embedded (progress 90%)
-
-```graphql
-mutation MarkEmbedded($id: uuid!) {
-  update_tt_ai_documents_by_pk(pk_columns: {id: $id}, _set: {status: "embedded"}) { id }
-}
-```
-
-### Stage 7 — Email notification
+### Stage 6 — Email notification
 
 If `AWS_SES_*` is configured and a `userId` was provided, an email is sent via AWS SES confirming the document is ready.
 
@@ -318,6 +391,19 @@ If `AWS_SES_*` is configured and a `userId` was provided, an email is sent via A
 | Model | `text-embedding-3-small` | `OPENAI_EMBEDDING_MODEL` |
 | Dimensions | 1536 | fixed by model |
 | Batch size | 200 texts/call | `OPENAI_EMBED_BATCH_SIZE` |
+| Max retries | 4 per batch | hardcoded |
+| Backoff | 2s → 4s → 8s → 16s | hardcoded |
+
+### Guarantees
+
+- **Never returns a partial list.** Either returns a complete list of vector strings (one per input, no `None` holes) or raises `RuntimeError`.
+- **Retries on transient failures.** Rate limits (429), server errors (500/503), and timeouts trigger exponential back-off up to 4 attempts per batch.
+- **Raises on non-retryable errors.** Invalid API key, model not found, etc. raise immediately without retrying.
+- **Final completeness check.** After all batches, every slot in the result list is verified non-None before returning.
+
+### Vector format
+
+Embeddings are returned as PostgreSQL vector literal strings: `"[0.123,0.456,...]"`. This is the format Hasura expects for `vector(1536)` columns — it exposes them as `String` scalars in GraphQL, not a native `vector` type.
 
 ### Why inline (same thread)?
 
@@ -326,13 +412,9 @@ If `AWS_SES_*` is configured and a `userId` was provided, an email is sent via A
 - The job progress bar reflects the embedding stage in real time
 - A separate queue/worker would add infrastructure complexity for no throughput gain at this scale
 
-### Failure handling
-
-Each batch is wrapped in a try/except. A failed batch logs an error but does not abort the job — the remaining batches continue. Chunks without embeddings are stored in the DB and can be re-processed later.
-
 ### Adding Mistral embeddings later
 
-The `tt_ai.chunks` table already has `embedding_mistral` and `mistral_model_name` columns. When you're ready, add a second pass in `_send_to_db` after the OpenAI pass, calling the Mistral API and updating those columns.
+The `tt_ai.chunks` table already has `embedding_mistral` and `mistral_model_name` columns. When ready, add a second pass in `_send_to_db` after the OpenAI pass, calling the Mistral API and inserting into those columns. The same insert-with-embedding pattern applies.
 
 ---
 
@@ -344,7 +426,7 @@ The `tt_ai.chunks` table already has `embedding_mistral` and `mistral_model_name
 
 Files are stored under:
 ```
-<DO_SPACES_BUCKET>/docs_pdf_embedding_sources/<document_id>/<filename>
+<DO_SPACES_BUCKET>/docs_pdf_embedding_sources/<job_id>/<filename>
 ```
 
 The returned URL is the permanent CDN link (e.g. `https://<bucket>.nyc3.cdn.digitaloceanspaces.com/...`) stored as `source` in `tt_ai.documents`. This URL is directly linkable and downloadable.
@@ -375,7 +457,7 @@ MAX_CONCURRENT_JOBS = 10  (configurable via env var)
 - A separate `_active_job_count` counter (protected by a `threading.Lock`) tracks the live count for the `/health` endpoint
 - Requests that arrive when all slots are full get an immediate `HTTP 503` with `active_jobs` and `max_concurrent_jobs` in the body
 
-This is intentionally simple. For Railway's single-instance deployment it is sufficient. If you scale to multiple instances, replace the semaphore with a Redis-backed distributed lock.
+For Railway's single-instance deployment this is sufficient. If you scale to multiple instances, replace the semaphore with a Redis-backed distributed lock.
 
 ---
 
@@ -392,25 +474,49 @@ Job state is stored in Redis (if `REDIS_URL` is set) or in an in-memory dict (si
 | `reading_complete` | 50 | All pages extracted |
 | `storing` | 52 | About to start DB pipeline |
 | `spaces_upload` | 55 | Uploading PDF to Spaces |
-| `insert_document` | 65 | Inserting document row |
-| `insert_chunks` | 70 | Inserting text chunks |
-| `embeddings` | 75 | Calling OpenAI API |
-| `store_embeddings` | 88 | Writing vectors to DB |
+| `insert_document` | 62 | Inserting document row |
+| `embeddings` | 68 | Calling OpenAI API |
+| `insert_chunks` | 85 | Writing chunks + vectors to DB |
 | `finalise` | 95 | Marking document embedded |
 | `done` | 100 | Complete |
-| `failed` | — | Error with message |
+| `failed` | — | Error — see `error` field |
 
 ### Polling
 
 ```
 GET /job/<job_id>
 
-→ { "status": "processing", "progress": 75, "stage": "embeddings", "message": "Generating ChatGPT embeddings…" }
+→ { "status": "processing", "progress": 68, "stage": "embeddings", "message": "Generating ChatGPT embeddings…" }
 → { "status": "completed",  "progress": 100, "db_result": { "document_id": "...", "chunk_count": 312 } }
 → { "status": "failed",     "error": "..." }
 ```
 
 Redis TTLs: completed jobs expire after 1 hour, failed jobs after 24 hours.
+
+---
+
+## Failure Contract
+
+This is the most important section for understanding what state the system is in after any failure.
+
+| Failure point | Document DB status | Chunks in DB | Job Redis status |
+|---|---|---|---|
+| Spaces upload fails | Never created | None | `failed` |
+| Document INSERT fails (GraphQL error) | Never created | None | `failed` |
+| OpenAI API fails after 4 retries | `failed` | None | `failed` |
+| Chunk INSERT fails (GraphQL error) | `failed` | Partial (some batches may have succeeded) | `failed` |
+| Chunk count mismatch | `failed` | Partial | `failed` |
+| MarkEmbedded fails | `processing` (stuck) | All present with vectors | `completed` |
+
+**The only ambiguous case** is the last row: if `MarkEmbedded` fails, the chunks are all correctly stored with vectors but the document status stays at `processing`. This is detectable — query `tt_ai.chunks` for `document_id` and check `count(*) > 0 AND embedding_chatgpt IS NOT NULL`.
+
+**Document status values:**
+
+| Status | Meaning |
+|---|---|
+| `processing` | Background thread still running (or MarkEmbedded failed — see above) |
+| `embedded` | All chunks stored with vectors — fully ready for search |
+| `failed` | Something went wrong — check service logs for the job_id |
 
 ---
 
@@ -421,7 +527,7 @@ Redis TTLs: completed jobs expire after 1 hour, failed jobs after 24 hours.
 | `NHOST_BACKEND_URL` | Yes | — | Nhost project URL (e.g. `https://xxx.nhost.run`) |
 | `NHOST_ADMIN_SECRET` | Yes | — | Hasura admin secret |
 | `NHOST_GRAPHQL_URL` | No | `<NHOST_BACKEND_URL>/v1/graphql` | Override GraphQL endpoint |
-| `OPENAI_API_KEY` | Yes* | — | OpenAI secret key (*required for embeddings) |
+| `OPENAI_API_KEY` | Yes | — | OpenAI secret key (required for embeddings) |
 | `OPENAI_EMBEDDING_MODEL` | No | `text-embedding-3-small` | Embedding model name |
 | `OPENAI_EMBED_BATCH_SIZE` | No | `200` | Texts per OpenAI API call |
 | `DO_SPACES_URL` | No | — | Spaces endpoint URL |
@@ -477,7 +583,7 @@ Schema: `tt_ai`
 | `printed_page` | text | Printed page number from document header (e.g. `7-5`) |
 | `chapter` | text | Chapter/section name from document header |
 | `char_count` | integer | Character count of `content` |
-| `embedding_chatgpt` | vector(1536) | OpenAI `text-embedding-3-small` vector |
+| `embedding_chatgpt` | vector(1536) | OpenAI `text-embedding-3-small` vector — always set on insert |
 | `chatgpt_model_name` | text | Model used for `embedding_chatgpt` |
 | `embedding_mistral` | vector(1536) | Mistral embedding (future) |
 | `mistral_model_name` | text | Model used for `embedding_mistral` (future) |
@@ -496,7 +602,7 @@ Accepts a PDF, starts background processing, returns a `job_id`.
 | Field | Required | Description |
 |---|---|---|
 | `file` | Yes | PDF file (max 200 MB) |
-| `userId` | No | UUID of the uploading user |
+| `userId` | No | UUID of the uploading user (camelCase; `user_id` also accepted) |
 | `upload_device` | No | Device label, default `web` |
 | `send_to_nhost` | No | `true`/`false`, default `true` |
 | `send_webhook` | No | `true`/`false`, default `true` |
@@ -508,7 +614,7 @@ Accepts a PDF, starts background processing, returns a `job_id`.
 { "success": true, "job_id": "uuid", "status": "processing" }
 ```
 
-**Response `503`:**
+**Response `503` (all slots busy):**
 ```json
 { "success": false, "error": "Busy – try again later", "active_jobs": 10 }
 ```
@@ -518,9 +624,9 @@ Accepts a PDF, starts background processing, returns a `job_id`.
 ### `GET /job/<job_id>` — poll for status
 
 ```json
-{ "status": "processing", "progress": 75, "stage": "embeddings", "message": "..." }
-{ "status": "completed",  "progress": 100, "db_result": { "document_id": "...", "chunk_count": 312 } }
-{ "status": "failed",     "error": "..." }
+{ "status": "processing", "progress": 68, "stage": "embeddings", "message": "Generating ChatGPT embeddings…" }
+{ "status": "completed",  "progress": 100, "db_result": { "document_id": "uuid", "chunk_count": 312 } }
+{ "status": "failed",     "error": "Database storage or embedding generation failed. Check service logs." }
 ```
 
 ---
@@ -541,4 +647,4 @@ Returns current Nhost/OpenAI configuration state (no secrets, just whether they 
 
 ### `POST /extract` — synchronous (small PDFs only)
 
-Blocks until complete. Not recommended for production. Accepts the same form fields as `/extract/async` plus `send_to_nhost=true` to trigger DB storage inline.
+Blocks until complete. Not recommended for production. Accepts the same form fields as `/extract/async` plus `send_to_nhost=true` to trigger DB storage inline. No Spaces upload (no local file path available in the sync path).
