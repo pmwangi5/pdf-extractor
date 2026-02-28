@@ -182,30 +182,58 @@ def _extract_header_info(all_words: List[dict], page_height: float) -> Tuple[Opt
     Extract printed page number and chapter name directly from the header band words.
 
     The header band is the top ~270 units of the page (before main content).
-    Page numbers appear as isolated "N-NN" or "N" tokens; everything else is the chapter name.
+    Page numbers appear as isolated "N-NN" or plain small-integer tokens.
+    Everything else is the chapter name.
+
+    Disambiguation rules for plain integers:
+      - "N-NN" / "NN-NNN" chapter-page format is always accepted (unambiguous).
+      - A plain integer is only accepted as a page number if ALL of:
+          • It is ≤ 4 digits
+          • It does NOT look like a calendar year (1800–2099)
+          • It is ≤ 9999
+      - The FIRST qualifying token wins; the rest become chapter name tokens.
 
     Returns:
         (printed_page_number, chapter_name)  — either may be None.
     """
-    # Collect words in the header band
+    # Collect words in the header band (top 270 pt)
     header_words = [w for w in all_words if float(w["top"]) < 270]
     if not header_words:
         return None, None
 
-    # Reconstruct header as a flat left-to-right string
+    # Left-to-right order
     header_sorted = sorted(header_words, key=lambda w: w["x0"])
-    tokens = [w["text"] for w in header_sorted]
+    tokens = [_substitute_cid(w["text"]).strip() for w in header_sorted]
 
-    # Find the page number token: matches "N-NN" or a plain integer
-    _pnum_re = re.compile(r"^\d+-\d+$|^\d+$")
+    # chapter-page format e.g. "7-5", "1-21" — always unambiguous
+    _chpage_re = re.compile(r"^\d{1,3}-\d{1,4}$")
+    # plain integer — will be filtered further
+    _int_re = re.compile(r"^\d{1,4}$")
+
+    def _is_year(s: str) -> bool:
+        """Return True if the string looks like a calendar year (1800–2099)."""
+        try:
+            n = int(s)
+            return 1800 <= n <= 2099
+        except ValueError:
+            return False
+
     page_num = None
     chapter_tokens = []
+
     for t in tokens:
-        clean = _substitute_cid(t).strip()
-        if _pnum_re.match(clean) and page_num is None:
-            page_num = clean
-        else:
-            chapter_tokens.append(clean)
+        if not t:
+            continue
+        if page_num is None:
+            if _chpage_re.match(t):
+                # Unambiguous chapter-page format
+                page_num = t
+                continue
+            if _int_re.match(t) and not _is_year(t):
+                # Small plain integer that is not a year → page number
+                page_num = t
+                continue
+        chapter_tokens.append(t)
 
     chapter = " ".join(chapter_tokens).strip() or None
     return page_num, chapter
