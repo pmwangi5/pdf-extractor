@@ -179,63 +179,96 @@ def _words_to_text(words: List[dict], y_tolerance: float = 4.0) -> str:
 
 def _extract_header_info(all_words: List[dict], page_height: float) -> Tuple[Optional[str], Optional[str]]:
     """
-    Extract printed page number and chapter name directly from the header band words.
+    Extract printed page number and chapter name from the true header strip.
 
-    The header band is the top ~270 units of the page (before main content).
-    Page numbers appear as isolated "N-NN" or plain small-integer tokens.
-    Everything else is the chapter name.
+    Strategy
+    --------
+    The header strip is the topmost LINE of text on the page — not a fixed
+    pixel band. We find the minimum `top` value among all words, then collect
+    only words whose `top` is within 8 pt of that minimum. This gives exactly
+    the first line (or first two closely-spaced lines in some layouts).
 
-    Disambiguation rules for plain integers:
-      - "N-NN" / "NN-NNN" chapter-page format is always accepted (unambiguous).
-      - A plain integer is only accepted as a page number if ALL of:
-          • It is ≤ 4 digits
-          • It does NOT look like a calendar year (1800–2099)
-          • It is ≤ 9999
-      - The FIRST qualifying token wins; the rest become chapter name tokens.
+    For car manuals this first line typically contains:
+        "ENGINE   7-5"   or   "7-5   ENGINE"
+
+    For regular documents (reports, forms, letters) the first line is usually
+    a title or header paragraph — page numbers on those documents appear in the
+    very top-right or bottom corner, handled separately below.
+
+    Page-number detection rules (applied only to the first-line words):
+      1. "N-NN" / "NN-NNN" format (chapter-page) — always accepted.
+      2. Plain integer ≤ 3 digits AND ≤ 999 AND not a year (1800-2099).
+         Rejects things like "120" that appear in body tables but happen to
+         sit near the top of the page when the header band is too tall.
+
+    Corner page-number fallback
+    ---------------------------
+    Many non-manual PDFs have a page number isolated in the top-right or
+    bottom-right corner (outside the main text flow). We look for a lone
+    integer in those positions only if nothing was found in the first line.
 
     Returns:
         (printed_page_number, chapter_name)  — either may be None.
     """
-    # Collect words in the header band (top 270 pt)
-    header_words = [w for w in all_words if float(w["top"]) < 270]
-    if not header_words:
+    if not all_words:
         return None, None
 
-    # Left-to-right order
-    header_sorted = sorted(header_words, key=lambda w: w["x0"])
-    tokens = [_substitute_cid(w["text"]).strip() for w in header_sorted]
+    # ── Step 1: Find the first (topmost) line ────────────────────────────────
+    min_top = min(float(w["top"]) for w in all_words)
+    # Collect words within 8 pt of the topmost word — this is the header line
+    first_line_words = [w for w in all_words if float(w["top"]) <= min_top + 8]
 
-    # chapter-page format e.g. "7-5", "1-21" — always unambiguous
+    # Left-to-right order for display / chapter name reconstruction
+    first_line_sorted = sorted(first_line_words, key=lambda w: w["x0"])
+    tokens = [_substitute_cid(w["text"]).strip() for w in first_line_sorted]
+
+    # chapter-page format e.g. "7-5", "1-21" — completely unambiguous
     _chpage_re = re.compile(r"^\d{1,3}-\d{1,4}$")
-    # plain integer — will be filtered further
-    _int_re = re.compile(r"^\d{1,4}$")
+    # plain integer — accepted only if ≤ 3 digits and not a year
+    _int_re = re.compile(r"^\d{1,3}$")
 
     def _is_year(s: str) -> bool:
-        """Return True if the string looks like a calendar year (1800–2099)."""
         try:
-            n = int(s)
-            return 1800 <= n <= 2099
+            return 1800 <= int(s) <= 2099
         except ValueError:
             return False
 
-    page_num = None
-    chapter_tokens = []
+    page_num: Optional[str] = None
+    chapter_tokens: List[str] = []
 
     for t in tokens:
         if not t:
             continue
         if page_num is None:
             if _chpage_re.match(t):
-                # Unambiguous chapter-page format
                 page_num = t
                 continue
             if _int_re.match(t) and not _is_year(t):
-                # Small plain integer that is not a year → page number
                 page_num = t
                 continue
         chapter_tokens.append(t)
 
     chapter = " ".join(chapter_tokens).strip() or None
+
+    # ── Step 2: Corner fallback (top-right or bottom-right lone integer) ─────
+    # Only used when the first-line scan found nothing.
+    if page_num is None:
+        page_w = max((float(w["x1"]) for w in all_words), default=0)
+        right_threshold = page_w * 0.75          # right 25 % of the page
+        top_threshold   = page_height * 0.08     # top 8 % of the page
+        bot_threshold   = page_height * 0.92     # bottom 8 % of the page
+
+        for w in all_words:
+            t = _substitute_cid(w["text"]).strip()
+            if not _int_re.match(t) or _is_year(t):
+                continue
+            x0 = float(w["x0"])
+            top = float(w["top"])
+            # Must be in right margin AND in top or bottom strip
+            if x0 >= right_threshold and (top <= top_threshold or top >= bot_threshold):
+                page_num = t
+                break
+
     return page_num, chapter
 
 
