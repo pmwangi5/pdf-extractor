@@ -1216,7 +1216,7 @@ def _generate_openai_embeddings(texts):
 
 def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
                 upload_device="web", file_path=None, user_display_name=None,
-                progress_cb=None):
+                garage_id=None, progress_cb=None):
     """
     Persist a processed PDF to the new tt_ai schema (tt_ai.documents + tt_ai.chunks)
     and generate ChatGPT embeddings for every chunk inline.
@@ -1246,6 +1246,7 @@ def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
         upload_device:      Device/platform label (default: 'web')
         file_path:          Local temp path of the PDF – used for Spaces upload
         user_display_name:  For email notification
+        garage_id:          Optional UUID of the garage that owns this document
         progress_cb:        Optional callable(stage: str, pct: int, msg: str)
 
     Returns:
@@ -1335,6 +1336,8 @@ def _send_to_db(data, job_id, filename, user_id=None, file_url=None,
         }
         if user_id:
             doc_object["userID"] = user_id
+        if garage_id:
+            doc_object["garageID"] = garage_id
 
         insert_doc_mutation = """
             mutation InsertDocument($obj: tt_ai_documents_insert_input!) {
@@ -1664,7 +1667,8 @@ def _send_webhook(job_id, status, data=None, error=None):
 
 def _process_extraction_async(file_path, original_filename, job_id, extract_type='all', pages=None,
                               include_tables=True, send_to_nhost=True,
-                              send_webhook=True, user_id=None, file_url=None, upload_device="web", user_display_name=None):
+                              send_webhook=True, user_id=None, file_url=None, upload_device="web",
+                              user_display_name=None, garage_id=None):
     """
     Process PDF extraction asynchronously.
     Optimized for large PDFs (800+ pages) with progress updates.
@@ -1831,6 +1835,7 @@ def _process_extraction_async(file_path, original_filename, job_id, extract_type
                 upload_device=upload_device,
                 file_path=file_path,
                 user_display_name=user_display_name,
+                garage_id=garage_id,
                 progress_cb=_progress_cb,
             )
 
@@ -2149,6 +2154,7 @@ def extract_pdf():
         if send_to_nhost:
             job_id = str(uuid.uuid4())
             user_id = request.form.get('userId') or request.form.get('user_id')
+            garage_id = request.form.get('garageId') or request.form.get('garage_id')
             file_url = request.form.get('file_url')
             upload_device = request.form.get('upload_device', 'web')
             user_display_name = request.form.get('user_display_name')
@@ -2160,6 +2166,7 @@ def extract_pdf():
                 upload_device=upload_device,
                 file_path=None,
                 user_display_name=user_display_name,
+                garage_id=garage_id,
             )
 
         response = {
@@ -2264,6 +2271,8 @@ def extract_pdf_async():
         send_webhook = request.form.get('send_webhook', 'true').lower() == 'true'
         # Accept both camelCase 'userId' (preferred) and snake_case 'user_id' (legacy)
         user_id = request.form.get('userId') or request.form.get('user_id')
+        # Accept both camelCase 'garageId' and snake_case 'garage_id'
+        garage_id = request.form.get('garageId') or request.form.get('garage_id')
         file_url = request.form.get('file_url')
         upload_device = request.form.get('upload_device', 'web')
         user_display_name = request.form.get('user_display_name')
@@ -2321,7 +2330,8 @@ def extract_pdf_async():
         thread = threading.Thread(
             target=_process_extraction_async,
             args=(temp_path, filename, job_id, extract_type, pages, include_tables,
-                  send_to_nhost, send_webhook, user_id, file_url, upload_device, user_display_name)
+                  send_to_nhost, send_webhook, user_id, file_url, upload_device,
+                  user_display_name, garage_id)
         )
         thread.daemon = True
         thread.start()

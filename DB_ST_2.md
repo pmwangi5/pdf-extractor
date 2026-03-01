@@ -51,6 +51,16 @@ upload_device- text, nullable
 
 job_id- text, nullable 
 
+
+document_description- text, nullable
+
+
+garageID- uuid, nullable
+
+
+publicConsumption- boolean, nullable, default: false
+
+
 #############################
 table: tt_ai_chunks
 
